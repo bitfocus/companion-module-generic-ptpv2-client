@@ -1,3 +1,13 @@
-## Your module
+# PTPv2 Client
 
-Write some help for your users here!
+Utility module to monitor PTPv2 on a network the companion instance is connected to.
+
+## Feedbacks
+
+- PTP Synced
+
+## Variables
+
+- PTP Master
+- PTP Time (s)
+- PTP Time (ns)

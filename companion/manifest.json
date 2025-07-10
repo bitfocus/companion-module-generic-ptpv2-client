@@ -1,16 +1,16 @@
 {
-	"id": "your-module-name",
-	"name": "your-module-name",
-	"shortname": "module-shortname",
-	"description": "A short one line description of your module",
+	"id": "ptpv2-client",
+	"name": "ptpv2-client",
+	"shortname": "PTPv2 Client",
+	"description": "Monitor PTPv2 on your network",
 	"version": "0.0.0",
 	"license": "MIT",
-	"repository": "git+https://github.com/bitfocus/companion-module-your-module-name.git",
-	"bugs": "https://github.com/bitfocus/companion-module-your-module-name/issues",
+	"repository": "git+https://github.com/phillipivan/companion-module-ptpv2-client.git",
+	"bugs": "https://github.com/phillipivan/companion-module-ptpv2-client/issues",
 	"maintainers": [
 		{
-			"name": "Your name",
-			"email": "Your email"
+			"name": "Phillip Ivan Pietruschka",
+			"email": ""
 		}
 	],
 	"runtime": {
@@ -20,7 +20,7 @@
 		"entrypoint": "../dist/main.js"
 	},
 	"legacyIds": [],
-	"manufacturer": "Your company",
-	"products": ["Your product"],
-	"keywords": []
+	"manufacturer": "Generic",
+	"products": ["PTP v2"],
+	"keywords": ["Precision Time Protocol", "IEEE 1588-2008"]
 }

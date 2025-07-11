@@ -5,5 +5,6 @@ export function UpdateVariableDefinitions(self: ModuleInstance): void {
 		{ variableId: 'ptpTimeS', name: 'PTP Time (S)' },
 		{ variableId: 'ptpTimeNS', name: 'PTP Time (nS)' },
 		{ variableId: 'ptpMaster', name: 'PTP Master' },
+		{ variableId: 'lastSync', name: 'Last Sync' },
 	])
 }

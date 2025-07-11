@@ -7,21 +7,8 @@ import { EventEmitter } from 'stream'
 const ptpMulticastAddrs = ['224.0.1.129', '224.0.1.130', '224.0.1.131', '224.0.1.132']
 
 //functions
-//creates ptp delay_req buffer
-const ptp_delay_req = (req_seq: number): Buffer<ArrayBuffer> => {
-	const length = 52
-	const buffer = Buffer.alloc(length)
-	req_seq = (req_seq + 1) % 0x10000
 
-	buffer.writeUInt8(1, 0)
-	buffer.writeUInt8(2, 1)
-	buffer.writeUInt16BE(length, 2)
-	buffer.writeUInt16BE(req_seq, 30)
-
-	return buffer
-}
-
-const getCorrectedTime = (offset: number[]): number[] => {
+const getCorrectedTime = (offset: [number, number]): [number, number] => {
 	const time = process.hrtime()
 	const timeS = time[0] - offset[0]
 	const timeNS = time[1] - offset[1]
@@ -30,9 +17,9 @@ const getCorrectedTime = (offset: number[]): number[] => {
 }
 
 export interface PTPv2ClientEvents {
-	ptp_master_changed: [ptp_master: string]
+	ptp_master_changed: [ptp_master: string, sync: boolean]
 	sync_changed: [sync: boolean]
-	ptp_time_synced: [time: number[]]
+	ptp_time_synced: [time: [number, number], lastSync: number]
 }
 
 export class PTPv2Client extends EventEmitter<PTPv2ClientEvents> {
@@ -48,17 +35,17 @@ export class PTPv2Client extends EventEmitter<PTPv2ClientEvents> {
 	private ptpClientGeneral = dgram.createSocket({ type: 'udp4', reuseAddr: true })
 
 	//vars
-	private t1: number[] = []
-	private ts1: number[] = []
-	private t2: number[] = []
-	private ts2: number[] = []
-	private offset: number[] = [0, 0]
+	private t1: [number, number] = [0, 0]
+	private ts1: [number, number] = [0, 0]
+	private t2: [number, number] = [0, 0]
+	private ts2: [number, number] = [0, 0]
+	private offset: [number, number] = [0, 0]
 	private sync_seq: number = 0
 	private req_seq: number = 0
 	private lastSync: number = 0
 
 	init(iface: string, domain: number): void {
-		this.addr = iface
+		this.addr = iface || '127.0.0.1'
 		if (domain <= 3 && domain >= 0) this.ptp_domain = domain
 		this.ptpClientEvent.bind(319)
 		this.ptpClientGeneral.bind(320)
@@ -101,8 +88,7 @@ export class PTPv2Client extends EventEmitter<PTPv2ClientEvents> {
 			if (source != this.ptpMaster) {
 				this.ptpMaster = source
 				this.sync = false
-				this.emit('ptp_master_changed', this.ptpMaster)
-				this.emit('sync_changed', this.sync)
+				this.emit('ptp_master_changed', this.ptpMaster, this.sync)
 			}
 
 			//save sequence number
@@ -122,7 +108,7 @@ export class PTPv2Client extends EventEmitter<PTPv2ClientEvents> {
 				this.t1 = [tsS, tsNS]
 
 				//send delay_req
-				this.ptpClientEvent.send(ptp_delay_req(this.req_seq), 319, ptpMulticastAddrs[this.ptp_domain], () => {
+				this.ptpClientEvent.send(this.ptp_delay_req(), 319, ptpMulticastAddrs[this.ptp_domain], () => {
 					this.t2 = getCorrectedTime(this.offset)
 				})
 
@@ -157,7 +143,7 @@ export class PTPv2Client extends EventEmitter<PTPv2ClientEvents> {
 				this.t1 = [tsS, tsNS]
 
 				//send delay_req
-				this.ptpClientEvent.send(ptp_delay_req(this.req_seq), 319, ptpMulticastAddrs[this.ptp_domain], () => {
+				this.ptpClientEvent.send(this.ptp_delay_req(), 319, ptpMulticastAddrs[this.ptp_domain], () => {
 					this.t2 = getCorrectedTime(this.offset)
 				})
 
@@ -181,7 +167,7 @@ export class PTPv2Client extends EventEmitter<PTPv2ClientEvents> {
 				this.offset[0] += deltaSplit[0]
 				this.offset[1] += deltaSplit[1]
 				this.lastSync = Date.now()
-				this.emit('ptp_time_synced', this.ptp_time)
+				this.emit('ptp_time_synced', this.ptp_time, this.lastSync)
 
 				//check if the clock was synced before
 				if (!this.sync) {
@@ -201,12 +187,26 @@ export class PTPv2Client extends EventEmitter<PTPv2ClientEvents> {
 		this.emit('sync_changed', this.sync)
 	}
 
-	public get ptp_time(): number[] {
+	public get ptp_time(): [number, number] {
 		const time = process.hrtime()
 		const timeS = time[0] - this.offset[0]
 		const timeNS = time[1] - this.offset[1]
 
 		return [timeS, timeNS]
+	}
+
+	//creates ptp delay_req buffer
+	private ptp_delay_req(): Buffer<ArrayBuffer> {
+		const length = 52
+		const buffer = Buffer.alloc(length)
+		this.req_seq = (this.req_seq + 1) % 0x10000
+
+		buffer.writeUInt8(1, 0)
+		buffer.writeUInt8(2, 1)
+		buffer.writeUInt16BE(length, 2)
+		buffer.writeUInt16BE(this.req_seq, 30)
+
+		return buffer
 	}
 
 	public get is_synced(): boolean {

@@ -14,15 +14,11 @@ export class ModuleInstance extends InstanceBase<ModuleConfig> {
 	}
 
 	async init(config: ModuleConfig): Promise<void> {
-		this.config = config
-		process.title = this.label
 		this.updateActions() // export actions
 		this.updateFeedbacks() // export feedbacks
 		this.updateVariableDefinitions() // export variable definitions
-		this.updateStatus(InstanceStatus.Ok)
-		this.client = new PTPv2Client()
-		this.client.init(config.interface, config.domain)
-		this.listenForClientEvents()
+		this.updateStatus(InstanceStatus.Connecting)
+		this.configUpdated(config).catch(() => {})
 	}
 	// When module gets deleted
 	async destroy(): Promise<void> {
@@ -37,23 +33,46 @@ export class ModuleInstance extends InstanceBase<ModuleConfig> {
 		if (this.client) this.client.destroy()
 
 		this.client = new PTPv2Client()
-		this.client.init(config.interface, config.domain)
-		this.listenForClientEvents()
+		if (config.interface) {
+			this.client.init(config.interface, config.domain)
+			this.listenForClientEvents()
+			this.getVarValues()
+			this.updateStatus(InstanceStatus.Ok)
+		} else {
+			this.updateStatus(InstanceStatus.BadConfig)
+		}
 	}
 
-	listenForClientEvents(): void {
-		this.client.on('ptp_master_changed', (ptp_master) => {
-			this.log('info', `PTPv2 Master ${ptp_master}`)
-			this.setVariableValues({ ptpMaster: ptp_master })
-		})
-		this.client.on('ptp_time_synced', (time) => {
-			this.log('info', `Time Synced ${time}`)
-			this.setVariableValues({ ptpTimeS: time[0], ptpTimeNS: time[1] })
-		})
-		this.client.on('sync_changed', (sync) => {
-			this.log('info', `PTP Sync Changed. ${sync ? 'Locked' : 'Unlocked'}`)
+	private listenForClientEvents(): void {
+		this.client.on('ptp_master_changed', (ptp_master, sync) => {
+			this.log('info', `PTPv2 Master Changed: ${ptp_master}`)
+			this.log(sync ? 'info' : 'warn', `PTP Sync Changed. ${sync ? 'Locked' : 'Unlocked'}`)
 			this.sync = sync
 			this.checkFeedbacks()
+			this.setVariableValues({ ptpMaster: ptp_master })
+		})
+		this.client.on('ptp_time_synced', (time, lastSync) => {
+			this.log('info', `Time Synced ${time}`)
+			const syncTime = new Date(lastSync)
+			this.setVariableValues({ ptpTimeS: time[0], ptpTimeNS: time[1], lastSync: syncTime.toISOString() })
+		})
+		this.client.on('sync_changed', (sync) => {
+			this.log(sync ? 'info' : 'warn', `PTP Sync Changed. ${sync ? 'Locked' : 'Unlocked'}`)
+			this.sync = sync
+			this.checkFeedbacks()
+		})
+	}
+
+	private getVarValues() {
+		const time = this.client.ptp_time
+		const ptp_master = this.client.ptp_master
+		const syncTime = new Date(this.client.last_sync)
+		this.sync = this.client.is_synced
+		this.setVariableValues({
+			ptpTimeS: time[0],
+			ptpTimeNS: time[1],
+			lastSync: syncTime.toISOString(),
+			ptpMaster: ptp_master,
 		})
 	}
 

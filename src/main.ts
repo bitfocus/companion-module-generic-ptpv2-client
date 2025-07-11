@@ -34,7 +34,7 @@ export class ModuleInstance extends InstanceBase<ModuleConfig> {
 		if (config.interface) {
 			try {
 				this.client = new PTPv2Client()
-				this.client.init(config.interface, config.domain)
+				this.client.init(config.interface, config.domain, config.interval)
 				this.listenForClientEvents()
 				this.getVarValues()
 				this.updateStatus(InstanceStatus.Ok)
@@ -48,20 +48,37 @@ export class ModuleInstance extends InstanceBase<ModuleConfig> {
 	}
 
 	private listenForClientEvents(): void {
-		this.client.on('ptp_master_changed', (ptp_master, sync) => {
-			this.log('info', `PTPv2 Master Changed: ${ptp_master}`)
+		this.client.on('ptp_master_changed', (ptp_master, master_address, sync) => {
+			this.log('info', `PTPv2 Master Changed: ${ptp_master} Address: ${master_address}`)
 			this.log(sync ? 'info' : 'warn', `PTP Sync Changed. ${sync ? 'Locked' : 'Unlocked'}`)
 			this.checkFeedbacks()
-			this.setVariableValues({ ptpMaster: ptp_master })
+			this.setVariableValues({ ptpMaster: ptp_master, ptpMasterAddress: master_address })
 		})
 		this.client.on('ptp_time_synced', (time, lastSync) => {
-			this.log('info', `Time Synced ${time}. Timy of sync ${lastSync}`)
 			const syncTime = new Date(lastSync)
+			this.log('info', `Time Synced ${time}. Timestemp of sync: ${syncTime.toISOString()}`)
 			this.setVariableValues({ ptpTimeS: time[0], ptpTimeNS: time[1], lastSync: syncTime.toISOString() })
 		})
 		this.client.on('sync_changed', (sync) => {
 			this.log(sync ? 'info' : 'warn', `PTP Sync Changed. ${sync ? 'Locked' : 'Unlocked'}`)
 			this.checkFeedbacks()
+		})
+		this.client.on('error', (err) => {
+			if (typeof err == 'string') {
+				this.log('warn', `Error binding to ports. ${err}`)
+				this.updateStatus(InstanceStatus.UnknownError)
+			} else {
+				this.log('warn', `Message send failure: ${JSON.stringify(err)}`)
+			}
+		})
+
+		this.client.on('close', (msg) => {
+			this.log('warn', msg)
+			this.updateStatus(InstanceStatus.Disconnected)
+		})
+		this.client.on('listening', (msg) => {
+			this.log('info', msg)
+			this.updateStatus(InstanceStatus.Ok)
 		})
 	}
 
@@ -73,7 +90,8 @@ export class ModuleInstance extends InstanceBase<ModuleConfig> {
 			ptpTimeS: time[0],
 			ptpTimeNS: time[1],
 			lastSync: syncTime.toISOString(),
-			ptpMaster: ptp_master,
+			ptpMaster: ptp_master[0],
+			ptpMasterAddress: ptp_master[1],
 		})
 		this.checkFeedbacks()
 	}

@@ -12,5 +12,6 @@ The module binds to ports 319 & 320.
 
 - Last Sync
 - PTP Master (Clock Identity)
+- PTP Master (Address)
 - PTP Time (s)
 - PTP Time (ns)

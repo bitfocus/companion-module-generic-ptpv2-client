@@ -4,6 +4,7 @@ import os from 'os'
 export interface ModuleConfig {
 	interface: string
 	domain: number
+	interval: number
 }
 
 export function GetConfigFields(): SomeCompanionConfigField[] {
@@ -37,6 +38,15 @@ export function GetConfigFields(): SomeCompanionConfigField[] {
 			default: 0,
 			range: true,
 			step: 1,
+		},
+		{
+			type: 'number',
+			id: 'interval',
+			label: 'Sync Interval (ms)',
+			width: 4,
+			min: 125,
+			max: 30000,
+			default: 10000,
 		},
 	]
 }

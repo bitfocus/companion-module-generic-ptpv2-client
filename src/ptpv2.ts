@@ -18,9 +18,12 @@ const getCorrectedTime = (offset: time): time => {
 }
 
 export interface PTPv2ClientEvents {
-	ptp_master_changed: [ptp_master: string, sync: boolean]
+	ptp_master_changed: [ptp_master: string, address: string, sync: boolean]
 	sync_changed: [sync: boolean]
 	ptp_time_synced: [time: time, lastSync: number]
+	error: [err: Error]
+	close: [msg: string]
+	listening: [msg: string]
 }
 
 export class PTPv2Client extends EventEmitter<PTPv2ClientEvents> {
@@ -29,6 +32,7 @@ export class PTPv2Client extends EventEmitter<PTPv2ClientEvents> {
 	private ptp_domain: number = 0
 	private sync: boolean = false
 	private ptpMaster: string = ''
+	private ptpMasterAddress: string = ''
 	private minSyncInterval: number = 10000
 
 	//PTPv2
@@ -45,23 +49,39 @@ export class PTPv2Client extends EventEmitter<PTPv2ClientEvents> {
 	private req_seq: number = 0
 	private lastSync: number = 0
 
-	init(iface: string, domain: number): void {
+	init(iface: string, domain: number = 0, interval: number = 10000): void {
 		this.addr = iface || '127.0.0.1'
-		if (domain <= 3 && domain >= 0) this.ptp_domain = domain
-		this.ptpClientEvent.bind(319)
-		this.ptpClientGeneral.bind(320)
+		if (domain <= 3 && domain >= 0) this.ptp_domain = Math.round(domain)
+		if (interval >= 125) this.minSyncInterval = Math.round(interval)
+
 		this.ptpClientEvent.on('listening', () => {
 			this.ptpClientEvent.addMembership(ptpMulticastAddrs[this.ptp_domain], this.addr)
+			this.emit('listening', `ptpClientEvent socket listening`)
 		})
 		this.ptpClientGeneral.on('listening', () => {
 			this.ptpClientGeneral.addMembership(ptpMulticastAddrs[this.ptp_domain], this.addr)
+			this.emit('listening', `ptpClientGeneral socket listening`)
+		})
+		this.ptpClientEvent.on('error', (err) => {
+			this.emit('error', err)
+		})
+		this.ptpClientGeneral.on('error', (err) => {
+			this.emit('error', err)
 		})
 
-		this.ptpClientEvent.on('message', (buffer, _remote): void => {
+		this.ptpClientEvent.on('close', () => {
+			this.emit('close', `ptpClientEvent socket closed`)
+		})
+		this.ptpClientGeneral.on('close', () => {
+			this.emit('close', `ptpClientGeneral socket closed`)
+		})
+
+		this.ptpClientEvent.on('message', (buffer, rinfo): void => {
+			console.log(`Event Message: ${buffer.toString()}`)
 			const recv_ts = getCorrectedTime(this.offset) //safe timestamp for ts1
 
 			//check buffer length
-			if (buffer.length < 31) return
+			if (buffer.length < 32) return
 
 			//read values from buffer
 			const type = buffer.readUInt8(0) & 0x0f
@@ -88,8 +108,9 @@ export class PTPv2Client extends EventEmitter<PTPv2ClientEvents> {
 			//do we have a new ptp master?
 			if (source != this.ptpMaster) {
 				this.ptpMaster = source
+				this.ptpMasterAddress = rinfo.address
 				this.sync = false
-				this.emit('ptp_master_changed', this.ptpMaster, this.sync)
+				this.emit('ptp_master_changed', this.ptpMaster, rinfo.address, this.sync)
 			}
 
 			//save sequence number
@@ -100,6 +121,7 @@ export class PTPv2Client extends EventEmitter<PTPv2ClientEvents> {
 				//two step, wait for follow_up msg for accurate t1
 				this.ts1 = recv_ts
 			} else if (Date.now() - this.lastSync > this.minSyncInterval) {
+				if (buffer.length < 44) return
 				//got accurate t1 (no follow_up msg)
 				this.ts1 = recv_ts
 
@@ -109,20 +131,28 @@ export class PTPv2Client extends EventEmitter<PTPv2ClientEvents> {
 				this.t1 = [tsS, tsNS]
 
 				//send delay_req
-				this.ptpClientEvent.send(this.ptp_delay_req(), 319, ptpMulticastAddrs[this.ptp_domain], () => {
-					this.t2 = getCorrectedTime(this.offset)
+				setImmediate(() => {
+					this.ptpClientEvent.send(this.ptp_delay_req(), 319, ptpMulticastAddrs[this.ptp_domain], (err, _bytes) => {
+						if (err) {
+							console.log(err)
+							this.emit('error', err)
+						} else {
+							this.t2 = getCorrectedTime(this.offset)
+						}
+					})
 				})
 
 				this.t2 = getCorrectedTime(this.offset)
 			}
 		})
 
-		this.ptpClientGeneral.on('message', (buffer, _remote): void => {
+		this.ptpClientGeneral.on('message', (buffer, _rinfo): void => {
+			console.log(`General Message: ${buffer.toString()}`)
 			//safe timestamp for ts2
 			//const recv_ts = getCorrectedTime(this.offset)
 
 			//check buffer length
-			if (buffer.length < 31) return
+			if (buffer.length < 32) return
 
 			//read values from buffer
 			const type = buffer.readUInt8(0) & 0x0f
@@ -134,18 +164,25 @@ export class PTPv2Client extends EventEmitter<PTPv2ClientEvents> {
 			const sequence = buffer.readUInt16BE(30)
 
 			//check for version 2 and domain
-			if (version != 2 || domain != this.ptp_domain) return
-
+			if (version != 2 || domain != this.ptp_domain || buffer.length < 44) return
 			if (type == 0x08 && this.sync_seq == sequence && Date.now() - this.lastSync > this.minSyncInterval) {
 				//follow up msg with current seq
 				//read t1 timestamp
+
 				const tsS = (buffer.readUInt16BE(34) << 4) + buffer.readUInt32BE(36)
 				const tsNS = buffer.readUInt32BE(40)
 				this.t1 = [tsS, tsNS]
 
 				//send delay_req
-				this.ptpClientEvent.send(this.ptp_delay_req(), 319, ptpMulticastAddrs[this.ptp_domain], () => {
-					this.t2 = getCorrectedTime(this.offset)
+				setImmediate(() => {
+					this.ptpClientEvent.send(this.ptp_delay_req(), 319, ptpMulticastAddrs[this.ptp_domain], (err, _bytes) => {
+						if (err) {
+							console.log(err)
+							this.emit('error', err)
+						} else {
+							this.t2 = getCorrectedTime(this.offset)
+						}
+					})
 				})
 
 				this.t2 = getCorrectedTime(this.offset)
@@ -161,7 +198,7 @@ export class PTPv2Client extends EventEmitter<PTPv2ClientEvents> {
 					0.5 * (this.ts1[0] - this.t1[0] - this.ts2[0] + this.t2[0]) * 1000000000 +
 					0.5 * (this.ts1[1] - this.t1[1] - this.ts2[1] + this.t2[1])
 
-				const deltaSplit = [0, 0]
+				const deltaSplit: time = [0, 0]
 				deltaSplit[1] = delta % 1000000000
 				deltaSplit[0] = Math.round((delta - deltaSplit[1]) / 1000000000)
 
@@ -177,6 +214,9 @@ export class PTPv2Client extends EventEmitter<PTPv2ClientEvents> {
 				}
 			}
 		})
+
+		this.ptpClientEvent.bind(319)
+		this.ptpClientGeneral.bind(320)
 	}
 
 	public destroy(): void {
@@ -206,8 +246,9 @@ export class PTPv2Client extends EventEmitter<PTPv2ClientEvents> {
 		return this.sync
 	}
 
-	public get ptp_master(): string {
-		return this.ptp_master
+	public get ptp_master(): [string, string] {
+		const ptp: [string, string] = [this.ptpMaster, this.ptpMasterAddress]
+		return ptp
 	}
 
 	public get last_sync(): number {

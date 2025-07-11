@@ -1,12 +1,12 @@
 {
-	"id": "ptpv2-client",
-	"name": "ptpv2-client",
+	"id": "generic-ptpv2-client",
+	"name": "generic-ptpv2-client",
 	"shortname": "PTPv2 Client",
 	"description": "Monitor PTPv2 on your network",
 	"version": "0.0.0",
 	"license": "MIT",
-	"repository": "git+https://github.com/phillipivan/companion-module-ptpv2-client.git",
-	"bugs": "https://github.com/phillipivan/companion-module-ptpv2-client/issues",
+	"repository": "git+https://github.com/bitfocus/companion-module-generic-ptpv2-client.git",
+	"bugs": "https://github.com/bitfocus/companion-module-generic-ptpv2-client/issues",
 	"maintainers": [
 		{
 			"name": "Phillip Ivan Pietruschka",

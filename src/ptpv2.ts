@@ -1,14 +1,15 @@
-// Typescript PTPv2 Client based on Phil Hartung's node-ptpv2 client
+// Typescript PTPv2 Client based on Philipp Hartung's node-ptpv2 client
+// July 2025 Phillip Ivan Pietruschka
 
 import dgram from 'dgram'
 import { EventEmitter } from 'stream'
-
+export type time = [number, number]
 //PTPv2
 const ptpMulticastAddrs = ['224.0.1.129', '224.0.1.130', '224.0.1.131', '224.0.1.132']
 
 //functions
 
-const getCorrectedTime = (offset: [number, number]): [number, number] => {
+const getCorrectedTime = (offset: time): time => {
 	const time = process.hrtime()
 	const timeS = time[0] - offset[0]
 	const timeNS = time[1] - offset[1]
@@ -19,7 +20,7 @@ const getCorrectedTime = (offset: [number, number]): [number, number] => {
 export interface PTPv2ClientEvents {
 	ptp_master_changed: [ptp_master: string, sync: boolean]
 	sync_changed: [sync: boolean]
-	ptp_time_synced: [time: [number, number], lastSync: number]
+	ptp_time_synced: [time: time, lastSync: number]
 }
 
 export class PTPv2Client extends EventEmitter<PTPv2ClientEvents> {
@@ -35,11 +36,11 @@ export class PTPv2Client extends EventEmitter<PTPv2ClientEvents> {
 	private ptpClientGeneral = dgram.createSocket({ type: 'udp4', reuseAddr: true })
 
 	//vars
-	private t1: [number, number] = [0, 0]
-	private ts1: [number, number] = [0, 0]
-	private t2: [number, number] = [0, 0]
-	private ts2: [number, number] = [0, 0]
-	private offset: [number, number] = [0, 0]
+	private t1: time = [0, 0]
+	private ts1: time = [0, 0]
+	private t2: time = [0, 0]
+	private ts2: time = [0, 0]
+	private offset: time = [0, 0]
 	private sync_seq: number = 0
 	private req_seq: number = 0
 	private lastSync: number = 0
@@ -187,14 +188,6 @@ export class PTPv2Client extends EventEmitter<PTPv2ClientEvents> {
 		this.emit('sync_changed', this.sync)
 	}
 
-	public get ptp_time(): [number, number] {
-		const time = process.hrtime()
-		const timeS = time[0] - this.offset[0]
-		const timeNS = time[1] - this.offset[1]
-
-		return [timeS, timeNS]
-	}
-
 	//creates ptp delay_req buffer
 	private ptp_delay_req(): Buffer<ArrayBuffer> {
 		const length = 52
@@ -221,5 +214,11 @@ export class PTPv2Client extends EventEmitter<PTPv2ClientEvents> {
 		return this.lastSync
 	}
 
-	//event msg client
+	public get ptp_time(): time {
+		const time = process.hrtime()
+		const timeS = time[0] - this.offset[0]
+		const timeNS = time[1] - this.offset[1]
+
+		return [timeS, timeNS]
+	}
 }

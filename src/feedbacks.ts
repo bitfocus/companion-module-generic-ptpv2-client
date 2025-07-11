@@ -12,7 +12,7 @@ export function UpdateFeedbacks(self: ModuleInstance): void {
 			},
 			options: [],
 			callback: (_feedback) => {
-				return self.sync
+				return self.client.is_synced
 			},
 		},
 	})

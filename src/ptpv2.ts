@@ -1,6 +1,3 @@
-// Typescript PTPv2 Client based on Philipp Hartung's node-ptpv2 client
-// July 2025 Phillip Ivan Pietruschka
-
 import dgram from 'dgram'
 import { EventEmitter } from 'stream'
 export type time = [number, number]
@@ -26,6 +23,13 @@ export interface PTPv2ClientEvents {
 	listening: [msg: string]
 }
 
+/**
+ * Class providing a PTPv2 Client based on Philipp Hartung's node-ptpv2 client
+ *
+ * @author Phillip Ivan Pietruschka <ivanpietruschka@gmail.com>
+ * @since July, 2025
+ */
+
 export class PTPv2Client extends EventEmitter<PTPv2ClientEvents> {
 	//ptp settings
 	private addr: string = '127.0.0.1'
@@ -48,6 +52,14 @@ export class PTPv2Client extends EventEmitter<PTPv2ClientEvents> {
 	private sync_seq: number = 0
 	private req_seq: number = 0
 	private lastSync: number = 0
+
+	/**
+	 * Initialise the client
+	 *
+	 * @param iface interface to bind to
+	 * @param domain PTP domain to listen to (0-3)
+	 * @param interval Minimum PTP sync interval (125ms)
+	 */
 
 	init(iface: string, domain: number = 0, interval: number = 10000): void {
 		this.addr = iface || '127.0.0.1'
@@ -219,6 +231,11 @@ export class PTPv2Client extends EventEmitter<PTPv2ClientEvents> {
 		this.ptpClientGeneral.bind(320)
 	}
 
+	/**
+	 * Close the sockets
+	 *
+	 */
+
 	public destroy(): void {
 		this.ptpClientEvent.removeAllListeners()
 		this.ptpClientEvent.close()
@@ -228,7 +245,11 @@ export class PTPv2Client extends EventEmitter<PTPv2ClientEvents> {
 		this.emit('sync_changed', this.sync)
 	}
 
-	//creates ptp delay_req buffer
+	/**
+	 * Create ptp delay_req buffer
+	 *
+	 */
+
 	private ptp_delay_req(): Buffer<ArrayBuffer> {
 		const length = 52
 		const buffer = Buffer.alloc(length)
@@ -242,18 +263,40 @@ export class PTPv2Client extends EventEmitter<PTPv2ClientEvents> {
 		return buffer
 	}
 
+	/**
+	 * Is the client synced
+	 *
+	 */
+
 	public get is_synced(): boolean {
 		return this.sync
 	}
+
+	/**
+	 * Who is the ptp_master
+	 * @returns [ clockIdentiy, rinfo.Address ]
+	 *
+	 */
 
 	public get ptp_master(): [string, string] {
 		const ptp: [string, string] = [this.ptpMaster, this.ptpMasterAddress]
 		return ptp
 	}
 
+	/**
+	 * @returns timestamp of last sync event
+	 *
+	 */
+
 	public get last_sync(): number {
 		return this.lastSync
 	}
+
+	/**
+	 * PTP Time
+	 * @returns [ Time (seconds), Time (nanoseconds) ]
+	 *
+	 */
 
 	public get ptp_time(): time {
 		const time = process.hrtime()

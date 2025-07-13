@@ -33,8 +33,7 @@ export class ModuleInstance extends InstanceBase<ModuleConfig> {
 
 		if (config.interface) {
 			try {
-				this.client = new PTPv2Client()
-				this.client.init(config.interface, config.domain, config.interval)
+				this.client = new PTPv2Client(config.interface, config.domain, config.interval)
 				this.listenForClientEvents()
 				this.getVarValues()
 				this.updateStatus(InstanceStatus.Ok)
@@ -56,7 +55,7 @@ export class ModuleInstance extends InstanceBase<ModuleConfig> {
 		})
 		this.client.on('ptp_time_synced', (time, lastSync) => {
 			const syncTime = new Date(lastSync)
-			this.log('info', `Time Synced ${time}. Timestemp of sync: ${syncTime.toISOString()}`)
+			this.log('debug', `Time Synced ${time}. Timestamp of sync: ${syncTime.toISOString()}`)
 			this.setVariableValues({ ptpTimeS: time[0], ptpTimeNS: time[1], lastSync: syncTime.toISOString() })
 		})
 		this.client.on('sync_changed', (sync) => {
@@ -64,8 +63,8 @@ export class ModuleInstance extends InstanceBase<ModuleConfig> {
 			this.checkFeedbacks()
 		})
 		this.client.on('error', (err) => {
-			if (typeof err == 'string') {
-				this.log('warn', `Error binding to ports. ${err}`)
+			if (err.name == 'Already in use') {
+				this.log('warn', `Error binding to ports. ${JSON.stringify(err)}`)
 				this.updateStatus(InstanceStatus.UnknownError)
 			} else {
 				this.log('warn', `Message send failure: ${JSON.stringify(err)}`)

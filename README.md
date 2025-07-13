@@ -1,4 +1,4 @@
-# companion-module-ptpv2-client
+# companion-module-generic-ptpv2-client
 
 See [HELP.md](./companion/HELP.md) and [LICENSE](./LICENSE)
 

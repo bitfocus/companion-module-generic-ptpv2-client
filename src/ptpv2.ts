@@ -1,5 +1,6 @@
 import dgram from 'dgram'
-import { EventEmitter } from 'stream'
+import { EventEmitter } from 'events'
+
 export type PtpTime = [number, number]
 //PTPv2
 const ptpMulticastAddrs = ['224.0.1.129', '224.0.1.130', '224.0.1.131', '224.0.1.132']

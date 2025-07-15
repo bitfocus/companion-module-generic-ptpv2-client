@@ -5,9 +5,11 @@ import { UpgradeScripts } from './upgrades.js'
 import { UpdateActions } from './actions.js'
 import { UpdateFeedbacks } from './feedbacks.js'
 import { PTPv2Client } from './ptpv2.js'
+import { StatusManager } from './status.js'
 export class ModuleInstance extends InstanceBase<ModuleConfig> {
 	config!: ModuleConfig // Setup in init()
 	client!: PTPv2Client
+	statusManager = new StatusManager(this)
 	constructor(internal: unknown) {
 		super(internal)
 	}
@@ -16,7 +18,7 @@ export class ModuleInstance extends InstanceBase<ModuleConfig> {
 		this.updateActions() // export actions
 		this.updateFeedbacks() // export feedbacks
 		this.updateVariableDefinitions() // export variable definitions
-		this.updateStatus(InstanceStatus.Connecting)
+		this.statusManager.updateStatus(InstanceStatus.Connecting)
 		this.configUpdated(config).catch(() => {})
 	}
 	// When module gets deleted
@@ -36,13 +38,13 @@ export class ModuleInstance extends InstanceBase<ModuleConfig> {
 				this.client = new PTPv2Client(config.interface, config.domain, config.interval)
 				this.listenForClientEvents()
 				this.getVarValues()
-				this.updateStatus(InstanceStatus.Ok)
+				this.statusManager.updateStatus(InstanceStatus.Ok)
 			} catch (e) {
-				this.updateStatus(InstanceStatus.UnknownError)
+				this.statusManager.updateStatus(InstanceStatus.UnknownError)
 				this.log('warn', `Could not initialise PTP client ${e}`)
 			}
 		} else {
-			this.updateStatus(InstanceStatus.BadConfig)
+			this.statusManager.updateStatus(InstanceStatus.BadConfig)
 		}
 	}
 
@@ -57,27 +59,24 @@ export class ModuleInstance extends InstanceBase<ModuleConfig> {
 			const syncTime = new Date(lastSync)
 			this.log('debug', `Time Synced ${time}. Timestamp of sync: ${syncTime.toISOString()}`)
 			this.setVariableValues({ ptpTimeS: time[0], ptpTimeNS: time[1], lastSync: syncTime.toISOString() })
+			this.statusManager.updateStatus(InstanceStatus.Ok)
 		})
 		this.client.on('sync_changed', (sync) => {
 			this.log(sync ? 'info' : 'warn', `PTP Sync Changed. ${sync ? 'Locked' : 'Unlocked'}`)
 			this.checkFeedbacks()
 		})
 		this.client.on('error', (err) => {
-			if (err.name == 'Already in use') {
-				this.log('warn', `Error binding to ports. ${JSON.stringify(err)}`)
-				this.updateStatus(InstanceStatus.UnknownError)
-			} else {
-				this.log('warn', `Message send failure: ${JSON.stringify(err)}`)
-			}
+			this.statusManager.updateStatus(InstanceStatus.UnknownError)
+			this.log('warn', `Error: ${JSON.stringify(err)}`)
 		})
 
 		this.client.on('close', (msg) => {
 			this.log('warn', msg)
-			this.updateStatus(InstanceStatus.Disconnected)
+			this.statusManager.updateStatus(InstanceStatus.Disconnected)
 		})
 		this.client.on('listening', (msg) => {
 			this.log('info', msg)
-			this.updateStatus(InstanceStatus.Ok)
+			this.statusManager.updateStatus(InstanceStatus.Ok)
 		})
 	}
 
@@ -86,9 +85,9 @@ export class ModuleInstance extends InstanceBase<ModuleConfig> {
 		const ptp_master = this.client.ptp_master
 		const syncTime = new Date(this.client.last_sync)
 		this.setVariableValues({
-			ptpTimeS: time[0],
-			ptpTimeNS: time[1],
-			lastSync: syncTime.toISOString(),
+			ptpTimeS: this.client.last_sync == 0 ? undefined : time[0],
+			ptpTimeNS: this.client.last_sync == 0 ? undefined : time[1],
+			lastSync: this.client.last_sync == 0 ? '' : syncTime.toISOString(),
 			ptpMaster: ptp_master[0],
 			ptpMasterAddress: ptp_master[1],
 		})

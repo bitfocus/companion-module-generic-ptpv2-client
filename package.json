@@ -27,7 +27,7 @@
 		"lodash": "^4.17.23"
 	},
 	"devDependencies": {
-		"@companion-module/tools": "^2.3.0",
+		"@companion-module/tools": "^2.6.1",
 		"@types/lodash": "^4",
 		"@types/node": "^22.16.3",
 		"eslint": "^9.31.0",

@@ -36,11 +36,12 @@ export class ModuleInstance extends InstanceBase<ModuleConfig> {
 
 		if (config.interface) {
 			try {
-				switch (config.version) {
+				switch (config?.version) {
 					case 'ptpv1':
 						this.client = new PTPv1Client(config.interface, config.subdomain, config.interval)
 						break
 					case 'ptpv2':
+					default:
 						this.client = new PTPv2Client(config.interface, config.domain, config.interval)
 				}
 				this.listenForClientEvents()

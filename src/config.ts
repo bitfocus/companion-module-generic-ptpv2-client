@@ -8,9 +8,12 @@ import {
 	PTP_SUBDOMAIN_ALT4,
 	type PTP_SUBDOMAINS,
 } from './ptpv1.js'
+
+export type PtpVersion = 'ptpv1' | 'ptpv2'
+
 export interface ModuleConfig {
 	interface: string
-	version: 'ptpv1' | 'ptpv2'
+	version: PtpVersion
 	domain: number
 	subdomain: PTP_SUBDOMAINS
 	interval: number

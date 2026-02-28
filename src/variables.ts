@@ -6,7 +6,7 @@ export function UpdateVariableDefinitions(self: ModuleInstance): void {
 		{ variableId: 'ptpTimeNS', name: 'PTP Time (ns)' },
 		{
 			variableId: 'ptpMaster',
-			name: `PTP Master (${self.config.version == 'ptpv1' ? 'Source Identity' : 'Clock Identity'})`,
+			name: `PTP Master (${self.config?.version == 'ptpv1' ? 'Source Identity' : 'Clock Identity'})`,
 		},
 		{ variableId: 'ptpMasterAddress', name: 'PTP Master (Address)' },
 		{ variableId: 'lastSync', name: 'Last Sync Timestamp' },

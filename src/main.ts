@@ -46,10 +46,10 @@ export class ModuleInstance extends InstanceBase<ModuleConfig> {
 						this.client = new PTPv2Client(config.interface, config.domain, config.interval)
 				}
 				this.listenForClientEvents()
-				this.getVarValues()
 				this.updateActions() // export actions
 				this.updateFeedbacks() // export feedbacks
 				this.updateVariableDefinitions() // export variable definitions
+				this.getVarValues()
 			} catch (e) {
 				this.statusManager.updateStatus(InstanceStatus.UnknownError)
 				this.log('error', `Could not initialise PTP client ${e instanceof Error ? e.message : e}`)

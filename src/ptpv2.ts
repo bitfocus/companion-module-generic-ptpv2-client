@@ -9,8 +9,8 @@ export type PtpTime = [number, number]
 // Domains 4–127 are valid but have no dedicated address; they all share
 // 224.0.1.129 and are differentiated solely by the domain byte in the packet header.
 // Domains 128–255 are reserved by the standard.
-const PTP_PRIMARY_MULTICAST = '224.0.1.129'
-const ptpDedicatedMulticastAddrs = ['224.0.1.129', '224.0.1.130', '224.0.1.131', '224.0.1.132']
+export const PTP_PRIMARY_MULTICAST = '224.0.1.129'
+export const ptpDedicatedMulticastAddrs = ['224.0.1.129', '224.0.1.130', '224.0.1.131', '224.0.1.132']
 
 const ptpMulticastAddr = (domain: number): string =>
 	domain <= 3 ? ptpDedicatedMulticastAddrs[domain] : PTP_PRIMARY_MULTICAST
@@ -367,6 +367,14 @@ export class PTPv2Client extends EventEmitter<PTPv2ClientEvents> {
 		const time = process.hrtime()
 		// FIX: normalise to handle nanosecond underflow
 		return normalizePtpTime(time[0] - this.offset[0], time[1] - this.offset[1])
+	}
+
+	/**
+	 * PTP time as a single BigInt in nanoseconds.
+	 */
+	public get ptp_time_ns(): bigint {
+		const [s, ns] = this.ptp_time
+		return BigInt(s) * 1_000_000_000n + BigInt(ns)
 	}
 
 	/**

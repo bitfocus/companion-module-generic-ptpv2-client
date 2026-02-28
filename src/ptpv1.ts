@@ -42,7 +42,7 @@ export const PTP_MULTICAST = {
 	[PTP_SUBDOMAIN_ALT1]: '224.0.1.130',
 	[PTP_SUBDOMAIN_ALT2]: '224.0.1.131',
 	[PTP_SUBDOMAIN_ALT3]: '224.0.1.132',
-	[PTP_SUBDOMAIN_ALT4]: '224.0.1.129',
+	[PTP_SUBDOMAIN_ALT4]: '224.0.1.131',
 } as const satisfies Record<PTP_SUBDOMAINS, string>
 
 // Use for peer delay messages: Pdelay_Req, Pdelay_Resp and Pdelay_Resp_Follow_U
@@ -150,8 +150,7 @@ export interface PTPv1ClientEvents {
  * PTPv1 (IEEE 1588-2002) client.
  *
  * Key differences from PTPv2:
- *  - All subdomains share a single multicast address (224.0.1.129); subdomain
- *    filtering is performed by matching the 16-byte subdomain name field in
+ *  - All subdomain filtering is performed by matching the 16-byte subdomain name field in
  *    the packet header.
  *  - Message types are different: Sync=0x01, Delay_Req=0x02,
  *    Follow_Up=0x03, Delay_Resp=0x04.
@@ -415,6 +414,14 @@ export class PTPv1Client extends EventEmitter<PTPv1ClientEvents> {
 	public get ptp_time(): PtpTime {
 		const time = process.hrtime()
 		return normalizePtpTime(time[0] - this.offset[0], time[1] - this.offset[1])
+	}
+
+	/**
+	 * PTP time as a single BigInt in nanoseconds.
+	 */
+	public get ptp_time_ns(): bigint {
+		const [s, ns] = this.ptp_time
+		return BigInt(s) * 1_000_000_000n + BigInt(ns)
 	}
 
 	/** The configured subdomain name this client is listening on. */

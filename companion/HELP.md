@@ -6,7 +6,9 @@ The module binds to UDP ports 319 & 320 on the selected interface.
 
 ## Feedbacks
 
+- Domains / Subdomains
 - PTP Synced
+- PTP Time (nS)
 
 Module will report sync loss after twice the Sync interval duration without a sync event.
 

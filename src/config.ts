@@ -6,8 +6,11 @@ import {
 	PTP_SUBDOMAIN_ALT2,
 	PTP_SUBDOMAIN_ALT3,
 	PTP_SUBDOMAIN_ALT4,
+	PTP_MULTICAST,
 	type PTP_SUBDOMAINS,
 } from './ptpv1.js'
+
+import { PTP_PRIMARY_MULTICAST, ptpDedicatedMulticastAddrs } from './ptpv2.js'
 
 export type PtpVersion = 'ptpv1' | 'ptpv2'
 
@@ -18,6 +21,46 @@ export interface ModuleConfig {
 	subdomain: PTP_SUBDOMAINS
 	interval: number
 }
+
+const ptpv2MulticastFields = (): SomeCompanionConfigField[] => {
+	const fields: SomeCompanionConfigField[] = []
+
+	// Dedicated addresses for domains 1, 2, 3
+	for (const [domain, address] of Object.entries(ptpDedicatedMulticastAddrs)) {
+		if (domain === '0') continue // handled separately below with the 4-127 range
+		fields.push({
+			type: 'static-text',
+			id: `multicast_ptpv2_domain${domain}`,
+			label: 'Multicast Group',
+			value: address,
+			width: 4,
+			isVisibleExpression: `$(options:version) == 'ptpv2' && $(options:domain) == ${domain}`,
+		})
+	}
+
+	// Domain 0 and 4–127 all use 224.0.1.129
+	fields.push({
+		type: 'static-text',
+		id: 'multicast_ptpv2_domain0_or_high',
+		label: 'Multicast Group',
+		value: PTP_PRIMARY_MULTICAST,
+		width: 4,
+		isVisibleExpression: `$(options:version) == 'ptpv2' && ($(options:domain) == 0 || $(options:domain) >= 4)`,
+	})
+
+	return fields
+}
+
+// Generate one static-text field per PTPv1 subdomain from PTP_MULTICAST.
+const ptpv1MulticastFields = (): SomeCompanionConfigField[] =>
+	(Object.entries(PTP_MULTICAST) as [PTP_SUBDOMAINS, string][]).map(([subdomain, address]) => ({
+		type: 'static-text' as const,
+		id: `multicast_ptpv1_${subdomain.replace(/[^a-z0-9]/gi, '_')}`,
+		label: 'Multicast Group',
+		value: address,
+		width: 4,
+		isVisibleExpression: `$(options:version) == 'ptpv1' && $(options:subdomain) == '${subdomain}'`,
+	}))
 
 export function GetConfigFields(): SomeCompanionConfigField[] {
 	const interfaces = os.networkInterfaces()
@@ -34,6 +77,14 @@ export function GetConfigFields(): SomeCompanionConfigField[] {
 	return [
 		{
 			type: 'dropdown',
+			id: 'interface',
+			label: 'Interface',
+			width: 8,
+			choices: localNics,
+			default: localNics[0].id ?? 'No available NICs',
+		},
+		{
+			type: 'dropdown',
 			id: 'version',
 			label: 'Version',
 			choices: [
@@ -44,14 +95,6 @@ export function GetConfigFields(): SomeCompanionConfigField[] {
 			width: 4,
 		},
 		{
-			type: 'dropdown',
-			id: 'interface',
-			label: 'Interface',
-			width: 8,
-			choices: localNics,
-			default: localNics[0].id ?? 'No available NICs',
-		},
-		{
 			type: 'number',
 			id: 'domain',
 			label: 'Domain',
@@ -59,10 +102,12 @@ export function GetConfigFields(): SomeCompanionConfigField[] {
 			min: 0,
 			max: 127,
 			default: 0,
-			range: true,
+			range: false,
 			step: 1,
 			isVisibleExpression: `$(options:version) == 'ptpv2'`,
+			description: '1 to 127',
 		},
+		...ptpv2MulticastFields(),
 		{
 			type: 'dropdown',
 			id: 'subdomain',
@@ -78,6 +123,7 @@ export function GetConfigFields(): SomeCompanionConfigField[] {
 			default: PTP_SUBDOMAIN_DEFAULT,
 			isVisibleExpression: `$(options:version) == 'ptpv1'`,
 		},
+		...ptpv1MulticastFields(),
 		{
 			type: 'number',
 			id: 'interval',

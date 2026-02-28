@@ -1,7 +1,7 @@
 {
-	"extends": "@companion-module/tools/tsconfig/node18/recommended",
+	"extends": "@companion-module/tools/tsconfig/node22/recommended-esm",
 	"include": ["src/**/*.ts"],
-	"exclude": ["node_modules/**", "src/**/*spec.ts", "src/**/__tests__/*", "src/**/__mocks__/*"],
+	"exclude": ["node_modules/**", "src/**/*spec.ts", "src/**/__tests__/*", "src/**/__mocks__/*", "src/**/*test.ts"],
 	"compilerOptions": {
 		"outDir": "./dist",
 		"baseUrl": "./",
@@ -9,6 +9,6 @@
 			"*": ["./node_modules/*"]
 		},
 		"module": "Node16",
-		"moduleResolution": "Node16"
+		"moduleResolution": "nodenext"
 	}
 }

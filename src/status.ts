@@ -1,6 +1,6 @@
 import { InstanceBase, InstanceStatus } from '@companion-module/base'
 import type { ModuleConfig } from './config.js'
-import { throttle } from 'lodash'
+import { throttle } from 'es-toolkit'
 
 export interface Status {
 	status: InstanceStatus
@@ -22,6 +22,7 @@ export class StatusManager {
 	#parentInstance!: InstanceBase<ModuleConfig>
 	#throttleTimeout: number = 2000
 	#isDestroyed: boolean = false
+	#setNewStatus!: ((newStatus?: Status) => void) & { flush: () => void }
 
 	constructor(
 		self: InstanceBase<ModuleConfig>,
@@ -29,8 +30,31 @@ export class StatusManager {
 		throttleTimeout: number = 2000,
 	) {
 		this.#parentInstance = self
-		this.setNewStatus(initStatus)
+
 		this.#throttleTimeout = throttleTimeout
+
+		/**
+		 * Perform the status update
+		 * @param newStatus
+		 *
+		 */
+
+		this.#setNewStatus = throttle(
+			(newStatus: Status = this.#newStatus) => {
+				if (newStatus.message === null || typeof newStatus.message !== 'object') {
+					this.#parentInstance.updateStatus(newStatus.status, newStatus.message)
+				} else {
+					this.#parentInstance.updateStatus(newStatus.status, JSON.stringify(newStatus.message))
+				}
+				this.#currentStatus = newStatus
+			},
+			this.#throttleTimeout,
+			{
+				edges: ['trailing'],
+			},
+		)
+
+		this.#setNewStatus(initStatus)
 	}
 
 	/**
@@ -61,27 +85,8 @@ export class StatusManager {
 		}
 		if (this.#currentStatus.status === newStatus && this.#currentStatus.message === newMsg) return
 		this.#newStatus = { status: newStatus, message: newMsg }
-		this.setNewStatus(this.#newStatus)
+		this.#setNewStatus(this.#newStatus)
 	}
-
-	/**
-	 * Perform the status update
-	 * @param newStatus
-	 *
-	 */
-
-	private setNewStatus = throttle(
-		(newStatus: Status = this.#newStatus) => {
-			if (typeof newStatus.message === 'object') {
-				this.#parentInstance.updateStatus(newStatus.status, JSON.stringify(newStatus.message))
-			} else {
-				this.#parentInstance.updateStatus(newStatus.status, newStatus.message)
-			}
-			this.#currentStatus = newStatus
-		},
-		this.#throttleTimeout,
-		{ leading: true, trailing: true },
-	)
 
 	/**
 	 * Clears any running debounce timer, sets status to disconnected
@@ -89,8 +94,8 @@ export class StatusManager {
 	 */
 
 	public destroy(): void {
-		this.setNewStatus.flush()
-		this.setNewStatus({ status: InstanceStatus.Disconnected, message: 'Destroyed' })
+		this.#setNewStatus.flush()
+		this.#setNewStatus({ status: InstanceStatus.Disconnected, message: 'Destroyed' })
 		this.#isDestroyed = true
 	}
 }

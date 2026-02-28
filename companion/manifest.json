@@ -1,4 +1,5 @@
 {
+	"$schema": "../node_modules/@companion-module/base/assets/manifest.schema.json",
 	"id": "generic-ptpv2-client",
 	"name": "generic-ptpv2-client",
 	"shortname": "PTPv2 Client",

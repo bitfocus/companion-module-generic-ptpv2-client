@@ -34,7 +34,7 @@ export function GetConfigFields(): SomeCompanionConfigField[] {
 			label: 'Domain',
 			width: 4,
 			min: 0,
-			max: 3,
+			max: 127,
 			default: 0,
 			range: true,
 			step: 1,

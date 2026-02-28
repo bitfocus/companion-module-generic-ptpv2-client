@@ -1,18 +1,39 @@
 import dgram from 'dgram'
 import { EventEmitter } from 'events'
+import { isIPv4 } from 'net'
 
 export type PtpTime = [number, number]
-//PTPv2
-const ptpMulticastAddrs = ['224.0.1.129', '224.0.1.130', '224.0.1.131', '224.0.1.132']
+
+// PTPv2 multicast addressing per IEEE 1588-2008 §9.1:
+// Domains 0–3 each have a dedicated multicast address.
+// Domains 4–127 are valid but have no dedicated address; they all share
+// 224.0.1.129 and are differentiated solely by the domain byte in the packet header.
+// Domains 128–255 are reserved by the standard.
+const PTP_PRIMARY_MULTICAST = '224.0.1.129'
+const ptpDedicatedMulticastAddrs = ['224.0.1.129', '224.0.1.130', '224.0.1.131', '224.0.1.132']
+
+const ptpMulticastAddr = (domain: number): string =>
+	domain <= 3 ? ptpDedicatedMulticastAddrs[domain] : PTP_PRIMARY_MULTICAST
 
 //functions
+
+const normalizePtpTime = (s: number, ns: number): PtpTime => {
+	if (ns >= 1_000_000_000) {
+		s += Math.floor(ns / 1_000_000_000)
+		ns = ns % 1_000_000_000
+	} else if (ns < 0) {
+		const borrow = Math.ceil(-ns / 1_000_000_000)
+		s -= borrow
+		ns += borrow * 1_000_000_000
+	}
+	return [s, ns]
+}
 
 const getCorrectedTime = (offset: PtpTime): PtpTime => {
 	const time = process.hrtime()
 	const timeS = time[0] - offset[0]
 	const timeNS = time[1] - offset[1]
-
-	return [timeS, timeNS]
+	return normalizePtpTime(timeS, timeNS)
 }
 
 export interface PTPv2ClientEvents {
@@ -61,23 +82,29 @@ export class PTPv2Client extends EventEmitter<PTPv2ClientEvents> {
 	/**
 	 * Initialise the client
 	 *
-	 * @param iface interface to bind to
-	 * @param domain PTP domain to listen to (0-3)
+	 * @param iface IPv4 address of the interface to bind to (defaults to '0.0.0.0' for all interfaces)
+	 * @param domain PTP domain to listen to (0–127; domains 0–3 use dedicated multicast
+	 *               addresses, domains 4–127 share 224.0.1.129)
 	 * @param interval Minimum PTP sync interval (125ms)
 	 */
 
-	constructor(iface: string, domain: number = 0, interval: number = 10000) {
+	constructor(iface: string = '0.0.0.0', domain: number = 0, interval: number = 10000) {
 		super()
-		this.addr = iface || '127.0.0.1'
-		if (domain <= 3 && domain >= 0) this.ptp_domain = Math.round(domain)
+		if (!isIPv4(iface)) {
+			throw new TypeError(
+				`Invalid interface address "${iface}": must be a valid IPv4 address (e.g. '192.168.1.10') or '0.0.0.0' for all interfaces.`,
+			)
+		}
+		this.addr = iface
+		if (domain >= 0 && domain <= 127) this.ptp_domain = Math.round(domain)
 		if (interval >= 125) this.minSyncInterval = Math.round(interval)
 
 		this.ptpClientEvent.on('listening', () => {
-			this.ptpClientEvent.addMembership(ptpMulticastAddrs[this.ptp_domain], this.addr)
+			this.ptpClientEvent.addMembership(ptpMulticastAddr(this.ptp_domain), this.addr)
 			this.emit('listening', `ptpClientEvent socket listening`)
 		})
 		this.ptpClientGeneral.on('listening', () => {
-			this.ptpClientGeneral.addMembership(ptpMulticastAddrs[this.ptp_domain], this.addr)
+			this.ptpClientGeneral.addMembership(ptpMulticastAddr(this.ptp_domain), this.addr)
 			this.emit('listening', `ptpClientGeneral socket listening`)
 		})
 		this.ptpClientEvent.on('error', (err) => {
@@ -142,31 +169,28 @@ export class PTPv2Client extends EventEmitter<PTPv2ClientEvents> {
 				//got accurate t1 (no follow_up msg)
 				this.ts1 = recv_ts
 
-				//read t1 timestamp
-				const tsS = (buffer.readUInt16BE(34) << 4) + buffer.readUInt32BE(36)
+				// FIX: use * 2^32 instead of << 4 to correctly combine the 48-bit seconds field
+				const tsS = buffer.readUInt16BE(34) * 4294967296 + buffer.readUInt32BE(36)
 				const tsNS = buffer.readUInt32BE(40)
 				this.t1 = [tsS, tsNS]
 
 				//send delay_req
 				setImmediate(() => {
-					this.ptpClientEvent.send(this.ptp_delay_req(), 319, ptpMulticastAddrs[this.ptp_domain], (err, _bytes) => {
+					this.ptpClientEvent.send(this.ptp_delay_req(), 319, ptpMulticastAddr(this.ptp_domain), (err, _bytes) => {
 						if (err) {
 							console.log(err)
 							this.emit('error', err)
 						} else {
+							// FIX: only capture t2 after the packet has actually been sent
 							this.t2 = getCorrectedTime(this.offset)
 						}
 					})
 				})
-
-				this.t2 = getCorrectedTime(this.offset)
+				// FIX: removed redundant pre-send t2 assignment that was always overwritten
 			}
 		})
 
 		this.ptpClientGeneral.on('message', (buffer, _rinfo): void => {
-			//safe timestamp for ts2
-			//const recv_ts = getCorrectedTime(this.offset)
-
 			//check buffer length
 			if (buffer.length < 32) return
 
@@ -183,29 +207,28 @@ export class PTPv2Client extends EventEmitter<PTPv2ClientEvents> {
 			if (version != 2 || domain != this.ptp_domain || buffer.length < 44) return
 			if (type == 0x08 && this.sync_seq == sequence && Date.now() - this.lastSync > this.minSyncInterval) {
 				//follow up msg with current seq
-				//read t1 timestamp
-
-				const tsS = (buffer.readUInt16BE(34) << 4) + buffer.readUInt32BE(36)
+				// FIX: use * 2^32 instead of << 4 to correctly combine the 48-bit seconds field
+				const tsS = buffer.readUInt16BE(34) * 4294967296 + buffer.readUInt32BE(36)
 				const tsNS = buffer.readUInt32BE(40)
 				this.t1 = [tsS, tsNS]
 
 				//send delay_req
 				setImmediate(() => {
-					this.ptpClientEvent.send(this.ptp_delay_req(), 319, ptpMulticastAddrs[this.ptp_domain], (err, _bytes) => {
+					this.ptpClientEvent.send(this.ptp_delay_req(), 319, ptpMulticastAddr(this.ptp_domain), (err, _bytes) => {
 						if (err) {
 							console.log(err)
 							this.emit('error', err)
 						} else {
+							// FIX: only capture t2 after the packet has actually been sent
 							this.t2 = getCorrectedTime(this.offset)
 						}
 					})
 				})
-
-				this.t2 = getCorrectedTime(this.offset)
+				// FIX: removed redundant pre-send t2 assignment that was always overwritten
 			} else if (type == 0x09 && this.req_seq == sequence) {
 				//delay_rsp msg
-				//read ts2 timestamp
-				const tsS = (buffer.readUInt16BE(34) << 4) + buffer.readUInt32BE(36)
+				// FIX: use * 2^32 instead of << 4 to correctly combine the 48-bit seconds field
+				const tsS = buffer.readUInt16BE(34) * 4294967296 + buffer.readUInt32BE(36)
 				const tsNS = buffer.readUInt32BE(40)
 				this.ts2 = [tsS, tsNS]
 
@@ -214,12 +237,13 @@ export class PTPv2Client extends EventEmitter<PTPv2ClientEvents> {
 					0.5 * (this.ts1[0] - this.t1[0] - this.ts2[0] + this.t2[0]) * 1000000000 +
 					0.5 * (this.ts1[1] - this.t1[1] - this.ts2[1] + this.t2[1])
 
-				const deltaSplit: PtpTime = [0, 0]
-				deltaSplit[1] = delta % 1000000000
-				deltaSplit[0] = Math.round((delta - deltaSplit[1]) / 1000000000)
+				// FIX: use Math.trunc (not %) to correctly split negative deltas,
+				// then normalise the accumulated offset to keep ns within [0, 1e9)
+				const deltaS = Math.trunc(delta / 1_000_000_000)
+				const deltaNS = delta - deltaS * 1_000_000_000
 
-				this.offset[0] += deltaSplit[0]
-				this.offset[1] += deltaSplit[1]
+				this.offset = normalizePtpTime(this.offset[0] + deltaS, this.offset[1] + deltaNS)
+
 				this.lastSync = Date.now()
 				this.emit('ptp_time_synced', this.ptp_time, this.lastSync)
 				this.startSyncTimeout()
@@ -228,8 +252,8 @@ export class PTPv2Client extends EventEmitter<PTPv2ClientEvents> {
 			}
 		})
 		try {
-			this.ptpClientEvent.bind(319)
-			this.ptpClientGeneral.bind(320)
+			this.ptpClientEvent.bind(319, this.addr)
+			this.ptpClientGeneral.bind(320, this.addr)
 		} catch (e) {
 			console.log(e)
 			const err: Error = {
@@ -268,6 +292,8 @@ export class PTPv2Client extends EventEmitter<PTPv2ClientEvents> {
 		buffer.writeUInt8(1, 0)
 		buffer.writeUInt8(2, 1)
 		buffer.writeUInt16BE(length, 2)
+		// FIX: set the domain byte so masters on non-zero domains respond correctly
+		buffer.writeUInt8(this.ptp_domain, 4)
 		buffer.writeUInt16BE(this.req_seq, 30)
 
 		return buffer
@@ -339,10 +365,8 @@ export class PTPv2Client extends EventEmitter<PTPv2ClientEvents> {
 
 	public get ptp_time(): PtpTime {
 		const time = process.hrtime()
-		const timeS = time[0] - this.offset[0]
-		const timeNS = time[1] - this.offset[1]
-
-		return [timeS, timeNS]
+		// FIX: normalise to handle nanosecond underflow
+		return normalizePtpTime(time[0] - this.offset[0], time[1] - this.offset[1])
 	}
 
 	/**

@@ -16,9 +16,7 @@ export class ModuleInstance extends InstanceBase<ModuleConfig> {
 	}
 
 	async init(config: ModuleConfig): Promise<void> {
-		this.updateActions() // export actions
-		this.updateFeedbacks() // export feedbacks
-		this.updateVariableDefinitions() // export variable definitions
+		this.config = config
 		this.statusManager.updateStatus(InstanceStatus.Connecting)
 		this.configUpdated(config).catch(() => {})
 	}
@@ -29,8 +27,9 @@ export class ModuleInstance extends InstanceBase<ModuleConfig> {
 	}
 
 	async configUpdated(config: ModuleConfig): Promise<void> {
+		this.log('info', `Config Updated: ${this.id}: ${this.label}`)
+		this.log('debug', JSON.stringify(config))
 		this.config = config
-		process.title = this.label
 
 		if (this.client) this.client.destroy()
 
@@ -38,18 +37,22 @@ export class ModuleInstance extends InstanceBase<ModuleConfig> {
 			try {
 				switch (config?.version) {
 					case 'ptpv1':
+						this.log('info', `Initialising PTPv1 client. On: ${config.interface}, subdomain: ${config.subdomain}`)
 						this.client = new PTPv1Client(config.interface, config.subdomain, config.interval)
 						break
 					case 'ptpv2':
 					default:
+						this.log('info', `Initialising PTPv2 client. On: ${config.interface}, domain: ${config.domain}`)
 						this.client = new PTPv2Client(config.interface, config.domain, config.interval)
 				}
 				this.listenForClientEvents()
 				this.getVarValues()
-				this.statusManager.updateStatus(InstanceStatus.Ok)
+				this.updateActions() // export actions
+				this.updateFeedbacks() // export feedbacks
+				this.updateVariableDefinitions() // export variable definitions
 			} catch (e) {
 				this.statusManager.updateStatus(InstanceStatus.UnknownError)
-				this.log('warn', `Could not initialise PTP client ${e}`)
+				this.log('error', `Could not initialise PTP client ${e instanceof Error ? e.message : e}`)
 			}
 		} else {
 			this.statusManager.updateStatus(InstanceStatus.BadConfig)
@@ -84,7 +87,10 @@ export class ModuleInstance extends InstanceBase<ModuleConfig> {
 		})
 		this.client.on('listening', (msg) => {
 			this.log('info', msg)
-			this.statusManager.updateStatus(InstanceStatus.Ok)
+			this.statusManager.updateStatus(
+				InstanceStatus.Ok,
+				`Listening for ${this.config.version == 'ptpv1' ? 'PTPv1' : 'PTPv2'} on ${this.config.interface}`,
+			)
 		})
 	}
 

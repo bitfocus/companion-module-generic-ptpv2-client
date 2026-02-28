@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
-import type { PtpTime } from './ptpv1.js'
+import { PTP_SUBDOMAINS, PtpTime, PTP_MULTICAST } from './ptpv1.js'
 
 // ---------------------------------------------------------------------------
 // dgram mock
@@ -147,7 +147,7 @@ const rinfo = { address: '192.168.1.1', family: 'IPv4', port: 319, size: 44 }
 const eventSocket = () => mockSockets[mockSockets.length - 2]
 const generalSocket = () => mockSockets[mockSockets.length - 1]
 
-const makeClient = async (iface = '0.0.0.0', subdomain = '_DFLT', interval = 125) => {
+const makeClient = async (iface = '0.0.0.0', subdomain: PTP_SUBDOMAINS = '_DFLT', interval = 125) => {
 	const client = new PTPv1Client(iface, subdomain, interval)
 	await new Promise<void>((r) => setImmediate(r))
 	await new Promise<void>((r) => setImmediate(r))
@@ -228,7 +228,7 @@ describe('constructor – subdomain validation', () => {
 	it.each([PTP_SUBDOMAIN_DEFAULT, PTP_SUBDOMAIN_ALT1, PTP_SUBDOMAIN_ALT2, PTP_SUBDOMAIN_ALT3, PTP_SUBDOMAIN_ALT4])(
 		'accepts well-known subdomain "%s"',
 		(sd) => {
-			expect(() => new PTPv1Client('0.0.0.0', sd)).not.toThrow()
+			expect(() => new PTPv1Client('0.0.0.0', sd as PTP_SUBDOMAINS)).not.toThrow()
 		},
 	)
 
@@ -239,10 +239,12 @@ describe('constructor – subdomain validation', () => {
 		['DANTE_SUBDOMAIN_PULLDOWN_01', DANTE_SUBDOMAIN_PULLDOWN_01],
 		['DANTE_SUBDOMAIN_PULLDOWN_48', DANTE_SUBDOMAIN_PULLDOWN_48],
 	])('accepts Dante constant %s ("%s")', (_name, sd) => {
-		expect(() => new PTPv1Client('0.0.0.0', sd)).not.toThrow()
+		expect(() => new PTPv1Client('0.0.0.0', sd as PTP_SUBDOMAINS)).not.toThrow()
 	})
 
-	it('accepts a custom ASCII subdomain', () => {
+	// Subdomains limited to range used by Dante
+
+	/* 	it('accepts a custom ASCII subdomain', () => {
 		expect(() => new PTPv1Client('0.0.0.0', 'MYCLOCK')).not.toThrow()
 	})
 
@@ -290,7 +292,7 @@ describe('constructor – subdomain validation', () => {
 		const client = await makeClient('0.0.0.0', 'MYCLOCK')
 		expect(client.ptp_subdomain).toBe('MYCLOCK')
 		client.destroy()
-	})
+	}) */
 
 	it('defaults to _DFLT when no subdomain is supplied', async () => {
 		const client = await makeClient()
@@ -332,12 +334,12 @@ describe('socket setup', () => {
 	})
 
 	it('two clients with different subdomains still join the same multicast address', async () => {
-		const clientA = await makeClient('0.0.0.0', '_DFLT')
-		const clientB = await makeClient('0.0.0.0', '_ALT1')
+		const clientA = await makeClient('0.0.0.0', PTP_SUBDOMAIN_DEFAULT)
+		const clientB = await makeClient('0.0.0.0', PTP_SUBDOMAIN_ALT1)
 		const esA = mockSockets[0]
 		const esB = mockSockets[2]
-		expect(esA.addMembership).toHaveBeenCalledWith('224.0.1.129', '0.0.0.0')
-		expect(esB.addMembership).toHaveBeenCalledWith('224.0.1.129', '0.0.0.0')
+		expect(esA.addMembership).toHaveBeenCalledWith(PTP_MULTICAST[PTP_SUBDOMAIN_DEFAULT], '0.0.0.0')
+		expect(esB.addMembership).toHaveBeenCalledWith(PTP_MULTICAST[PTP_SUBDOMAIN_ALT1], '0.0.0.0')
 		clientA.destroy()
 		clientB.destroy()
 	})
@@ -881,19 +883,23 @@ describe('negative delta handling', () => {
 
 describe('subdomain filtering', () => {
 	it('processes packets from the configured subdomain and ignores others', async () => {
-		const client = await makeClient('0.0.0.0', '_ALT1')
+		const client = await makeClient('0.0.0.0', PTP_SUBDOMAIN_ALT1)
 		const masterSpy = vi.fn()
 		const syncedSpy = vi.fn()
 		client.on('ptp_master_changed', masterSpy)
 		client.on('ptp_time_synced', syncedSpy)
 
 		// Wrong subdomain — should be silently ignored
-		eventSocket().emit('message', makeSyncPacket({ subdomain: '_DFLT', flags: FLAG_ASSIST }), rinfo)
+		eventSocket().emit('message', makeSyncPacket({ subdomain: PTP_SUBDOMAIN_DEFAULT, flags: FLAG_ASSIST }), rinfo)
 		// Correct subdomain — should be processed
-		eventSocket().emit('message', makeSyncPacket({ subdomain: '_ALT1', flags: FLAG_ASSIST, sequence: 1 }), rinfo)
-		generalSocket().emit('message', makeFollowUp({ subdomain: '_ALT1', sequence: 1 }), rinfo)
+		eventSocket().emit(
+			'message',
+			makeSyncPacket({ subdomain: PTP_SUBDOMAIN_ALT1, flags: FLAG_ASSIST, sequence: 1 }),
+			rinfo,
+		)
+		generalSocket().emit('message', makeFollowUp({ subdomain: PTP_SUBDOMAIN_ALT1, sequence: 1 }), rinfo)
 		await new Promise<void>((r) => setImmediate(r))
-		generalSocket().emit('message', makeDelayResp({ subdomain: '_ALT1', sequence: 1 }), rinfo)
+		generalSocket().emit('message', makeDelayResp({ subdomain: PTP_SUBDOMAIN_ALT1, sequence: 1 }), rinfo)
 
 		expect(masterSpy).toHaveBeenCalledOnce()
 		expect(syncedSpy).toHaveBeenCalledOnce()
@@ -901,7 +907,7 @@ describe('subdomain filtering', () => {
 	})
 
 	it('subdomain matching is exact — a prefix of the configured name is rejected', async () => {
-		const client = await makeClient('0.0.0.0', '_DFLT')
+		const client = await makeClient('0.0.0.0', PTP_SUBDOMAIN_DEFAULT)
 		const spy = vi.fn()
 		client.on('ptp_master_changed', spy)
 		// '_DFL' is a valid prefix but not the same as '_DFLT'
@@ -911,7 +917,7 @@ describe('subdomain filtering', () => {
 	})
 
 	it('subdomain matching is exact — a suffix with trailing chars is rejected', async () => {
-		const client = await makeClient('0.0.0.0', '_DFLT')
+		const client = await makeClient('0.0.0.0', PTP_SUBDOMAIN_DEFAULT)
 		const spy = vi.fn()
 		client.on('ptp_master_changed', spy)
 		eventSocket().emit('message', makeSyncPacket({ subdomain: '_DFLTX', flags: FLAG_ASSIST }), rinfo)
@@ -1011,7 +1017,7 @@ describe('Dante subdomain constants', () => {
 		['pull-down -0.1% (_ALT3)', DANTE_SUBDOMAIN_PULLDOWN_01],
 		['48kHz pull-down -4% (_ALT4)', DANTE_SUBDOMAIN_PULLDOWN_48],
 	])('completes a full sync on Dante subdomain: %s', async (_label, subdomain) => {
-		const client = await makeClient('0.0.0.0', subdomain)
+		const client = await makeClient('0.0.0.0', subdomain as PTP_SUBDOMAINS)
 		const syncSpy = vi.fn()
 		const timeSpy = vi.fn()
 		client.on('sync_changed', syncSpy)

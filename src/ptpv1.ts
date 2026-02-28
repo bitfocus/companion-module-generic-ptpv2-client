@@ -4,10 +4,50 @@ import { isIPv4 } from 'net'
 
 export type PtpTime = [number, number]
 
+// Maximum valid subdomain name length (excluding the null terminator/padding).
+const SUBDOMAIN_MAX_LEN = 15
+
+// Well-known PTPv1 subdomain names (IEEE 1588-2002 Annex B)
+export const PTP_SUBDOMAIN_DEFAULT = '_DFLT'
+export const PTP_SUBDOMAIN_ALT1 = '_ALT1'
+export const PTP_SUBDOMAIN_ALT2 = '_ALT2'
+export const PTP_SUBDOMAIN_ALT3 = '_ALT3'
+export const PTP_SUBDOMAIN_ALT4 = '_ALT4'
+
+export type PTP_SUBDOMAINS =
+	| typeof PTP_SUBDOMAIN_DEFAULT
+	| typeof PTP_SUBDOMAIN_ALT1
+	| typeof PTP_SUBDOMAIN_ALT2
+	| typeof PTP_SUBDOMAIN_ALT3
+	| typeof PTP_SUBDOMAIN_ALT4
+
+// Dante (Audinate) subdomain aliases.
+// Dante uses PTPv1 with a separate clock domain per sample rate variant so that
+// devices running at different pull rates do not interfere with each other:
+//   _DFLT : standard rates (48 kHz, 96 kHz, …)
+//   _ALT1 : +4.1667% pull-up   (44.1 kHz derived from 48 kHz base)
+//   _ALT2 : +0.1%   pull-up
+//   _ALT3 : -0.1%   pull-down
+//   _ALT4 : -4%     pull-down  (48 kHz derived from 44.1 kHz base)
+export const DANTE_SUBDOMAIN_DEFAULT = PTP_SUBDOMAIN_DEFAULT
+export const DANTE_SUBDOMAIN_PULLUP_441 = PTP_SUBDOMAIN_ALT1
+export const DANTE_SUBDOMAIN_PULLUP_01 = PTP_SUBDOMAIN_ALT2
+export const DANTE_SUBDOMAIN_PULLDOWN_01 = PTP_SUBDOMAIN_ALT3
+export const DANTE_SUBDOMAIN_PULLDOWN_48 = PTP_SUBDOMAIN_ALT4
+
 // PTPv1 (IEEE 1588-2002) uses a single multicast address for all subdomains.
 // Subdomain differentiation is done entirely via the subdomain name field in
 // the packet header, not by separate multicast group membership.
-const PTP_MULTICAST = '224.0.1.129'
+export const PTP_MULTICAST = {
+	[PTP_SUBDOMAIN_DEFAULT]: '224.0.1.129',
+	[PTP_SUBDOMAIN_ALT1]: '224.0.1.130',
+	[PTP_SUBDOMAIN_ALT2]: '224.0.1.131',
+	[PTP_SUBDOMAIN_ALT3]: '224.0.1.132',
+	[PTP_SUBDOMAIN_ALT4]: '224.0.1.129',
+} as const satisfies Record<PTP_SUBDOMAINS, string>
+
+// Use for peer delay messages: Pdelay_Req, Pdelay_Resp and Pdelay_Resp_Follow_U
+export const PEER_DELAY_ADDRESS = '224.0.0.107'
 
 // PTPv1 message types (byte 16 of header)
 const MSG_SYNC = 0x01
@@ -42,37 +82,6 @@ const FLAG_ASSIST = 0x0008
 //   32–35 : timestamp seconds      (uint32 BE)
 //   36–39 : timestamp nanoseconds  (int32  BE — signed per spec)
 // ---------------------------------------------------------------------------
-
-// Maximum valid subdomain name length (excluding the null terminator/padding).
-const SUBDOMAIN_MAX_LEN = 15
-
-// Well-known PTPv1 subdomain names (IEEE 1588-2002 Annex B)
-export const PTP_SUBDOMAIN_DEFAULT = '_DFLT'
-export const PTP_SUBDOMAIN_ALT1 = '_ALT1'
-export const PTP_SUBDOMAIN_ALT2 = '_ALT2'
-export const PTP_SUBDOMAIN_ALT3 = '_ALT3'
-export const PTP_SUBDOMAIN_ALT4 = '_ALT4'
-
-export type PTP_SUBDOMAINS =
-	| typeof PTP_SUBDOMAIN_DEFAULT
-	| typeof PTP_SUBDOMAIN_ALT1
-	| typeof PTP_SUBDOMAIN_ALT2
-	| typeof PTP_SUBDOMAIN_ALT3
-	| typeof PTP_SUBDOMAIN_ALT4
-
-// Dante (Audinate) subdomain aliases.
-// Dante uses PTPv1 with a separate clock domain per sample rate variant so that
-// devices running at different pull rates do not interfere with each other:
-//   _DFLT : standard rates (48 kHz, 96 kHz, …)
-//   _ALT1 : +4.1667% pull-up   (44.1 kHz derived from 48 kHz base)
-//   _ALT2 : +0.1%   pull-up
-//   _ALT3 : -0.1%   pull-down
-//   _ALT4 : -4%     pull-down  (48 kHz derived from 44.1 kHz base)
-export const DANTE_SUBDOMAIN_DEFAULT = PTP_SUBDOMAIN_DEFAULT
-export const DANTE_SUBDOMAIN_PULLUP_441 = PTP_SUBDOMAIN_ALT1
-export const DANTE_SUBDOMAIN_PULLUP_01 = PTP_SUBDOMAIN_ALT2
-export const DANTE_SUBDOMAIN_PULLDOWN_01 = PTP_SUBDOMAIN_ALT3
-export const DANTE_SUBDOMAIN_PULLDOWN_48 = PTP_SUBDOMAIN_ALT4
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -158,7 +167,7 @@ export interface PTPv1ClientEvents {
 export class PTPv1Client extends EventEmitter<PTPv1ClientEvents> {
 	// settings
 	private addr: string = '0.0.0.0'
-	private subdomain: string = PTP_SUBDOMAIN_DEFAULT
+	private subdomain: PTP_SUBDOMAINS = PTP_SUBDOMAIN_DEFAULT
 	private subdomainBuf: Buffer = encodeSubdomain(PTP_SUBDOMAIN_DEFAULT)
 	private sync: boolean = false
 	private syncTimeout: NodeJS.Timeout | undefined = undefined
@@ -186,12 +195,12 @@ export class PTPv1Client extends EventEmitter<PTPv1ClientEvents> {
 	 *
 	 * @param iface      IPv4 address of the interface to bind to
 	 *                   (defaults to '0.0.0.0' for all interfaces)
-	 * @param subdomain  PTPv1 subdomain name to listen to, up to 15 ASCII characters
+	 * @param subdomain  PTPv1 subdomain name to listen to, limited to subdomains used by Dante
 	 *                   (defaults to '_DFLT', the standard default subdomain).
 	 *                   Use the exported PTP_SUBDOMAIN_* constants or supply your own.
 	 * @param interval   Minimum sync interval in ms (minimum 125ms, default 10000ms)
 	 */
-	constructor(iface: string = '0.0.0.0', subdomain: string = PTP_SUBDOMAIN_DEFAULT, interval: number = 10000) {
+	constructor(iface: string = '0.0.0.0', subdomain: PTP_SUBDOMAINS = PTP_SUBDOMAIN_DEFAULT, interval: number = 10000) {
 		super()
 
 		if (!isIPv4(iface)) {
@@ -221,11 +230,11 @@ export class PTPv1Client extends EventEmitter<PTPv1ClientEvents> {
 		if (interval >= 125) this.minSyncInterval = Math.round(interval)
 
 		this.ptpClientEvent.on('listening', () => {
-			this.ptpClientEvent.addMembership(PTP_MULTICAST, this.addr)
+			this.ptpClientEvent.addMembership(PTP_MULTICAST[this.subdomain], this.addr)
 			this.emit('listening', 'ptpClientEvent socket listening')
 		})
 		this.ptpClientGeneral.on('listening', () => {
-			this.ptpClientGeneral.addMembership(PTP_MULTICAST, this.addr)
+			this.ptpClientGeneral.addMembership(PTP_MULTICAST[this.subdomain], this.addr)
 			this.emit('listening', 'ptpClientGeneral socket listening')
 		})
 		this.ptpClientEvent.on('error', (err) => this.emit('error', err))
@@ -280,7 +289,7 @@ export class PTPv1Client extends EventEmitter<PTPv1ClientEvents> {
 				this.t1 = normalizePtpTime(tsS, tsNS)
 
 				setImmediate(() => {
-					this.ptpClientEvent.send(this.ptp_delay_req(), 319, PTP_MULTICAST, (err) => {
+					this.ptpClientEvent.send(this.ptp_delay_req(), 319, PTP_MULTICAST[this.subdomain], (err) => {
 						if (err) {
 							this.emit('error', err)
 						} else {
@@ -321,7 +330,7 @@ export class PTPv1Client extends EventEmitter<PTPv1ClientEvents> {
 				this.t1 = normalizePtpTime(tsS, tsNS)
 
 				setImmediate(() => {
-					this.ptpClientEvent.send(this.ptp_delay_req(), 319, PTP_MULTICAST, (err) => {
+					this.ptpClientEvent.send(this.ptp_delay_req(), 319, PTP_MULTICAST[this.subdomain], (err) => {
 						if (err) {
 							this.emit('error', err)
 						} else {

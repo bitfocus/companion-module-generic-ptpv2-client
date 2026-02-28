@@ -35,9 +35,8 @@ export const DANTE_SUBDOMAIN_PULLUP_01 = PTP_SUBDOMAIN_ALT2
 export const DANTE_SUBDOMAIN_PULLDOWN_01 = PTP_SUBDOMAIN_ALT3
 export const DANTE_SUBDOMAIN_PULLDOWN_48 = PTP_SUBDOMAIN_ALT4
 
-// PTPv1 (IEEE 1588-2002) uses a single multicast address for all subdomains.
-// Subdomain differentiation is done entirely via the subdomain name field in
-// the packet header, not by separate multicast group membership.
+// PTPv1 (IEEE 1588-2002) uses a four multicast addresses for all subdomains.
+
 export const PTP_MULTICAST = {
 	[PTP_SUBDOMAIN_DEFAULT]: '224.0.1.129',
 	[PTP_SUBDOMAIN_ALT1]: '224.0.1.130',

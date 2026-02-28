@@ -1,6 +1,6 @@
-# PTPv2 Client
+# PTPv1 & v2 Client
 
-Utility module to provide basic monitoring PTPv2 on a network the companion instance is connected to. For detailed diagnostics consider using Meinberg's PTP Track Hound.
+Utility module to provide basic monitoring PTPv1 & v2 on a network the companion instance is connected to. For detailed diagnostics consider using Meinberg's PTP Track Hound.
 
 The module binds to UDP ports 319 & 320 on the selected interface.
 

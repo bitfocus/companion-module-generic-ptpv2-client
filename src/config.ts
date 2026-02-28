@@ -1,9 +1,18 @@
 import type { SomeCompanionConfigField, DropdownChoice } from '@companion-module/base'
 import os from 'os'
-
+import {
+	PTP_SUBDOMAIN_DEFAULT,
+	PTP_SUBDOMAIN_ALT1,
+	PTP_SUBDOMAIN_ALT2,
+	PTP_SUBDOMAIN_ALT3,
+	PTP_SUBDOMAIN_ALT4,
+	type PTP_SUBDOMAINS,
+} from './ptpv1.js'
 export interface ModuleConfig {
 	interface: string
+	version: 'ptpv1' | 'ptpv2'
 	domain: number
+	subdomain: PTP_SUBDOMAINS
 	interval: number
 }
 
@@ -22,6 +31,17 @@ export function GetConfigFields(): SomeCompanionConfigField[] {
 	return [
 		{
 			type: 'dropdown',
+			id: 'version',
+			label: 'Version',
+			choices: [
+				{ id: 'ptpv1', label: 'PTP v1' },
+				{ id: 'ptpv2', label: 'PTP v2' },
+			],
+			default: 'ptpv2',
+			width: 4,
+		},
+		{
+			type: 'dropdown',
 			id: 'interface',
 			label: 'Interface',
 			width: 8,
@@ -38,6 +58,22 @@ export function GetConfigFields(): SomeCompanionConfigField[] {
 			default: 0,
 			range: true,
 			step: 1,
+			isVisibleExpression: `$(options:version) == 'ptpv2'`,
+		},
+		{
+			type: 'dropdown',
+			id: 'subdomain',
+			label: 'Subdomain',
+			width: 4,
+			choices: [
+				{ id: PTP_SUBDOMAIN_DEFAULT, label: PTP_SUBDOMAIN_DEFAULT },
+				{ id: PTP_SUBDOMAIN_ALT1, label: PTP_SUBDOMAIN_ALT1 },
+				{ id: PTP_SUBDOMAIN_ALT2, label: PTP_SUBDOMAIN_ALT2 },
+				{ id: PTP_SUBDOMAIN_ALT3, label: PTP_SUBDOMAIN_ALT3 },
+				{ id: PTP_SUBDOMAIN_ALT4, label: PTP_SUBDOMAIN_ALT4 },
+			],
+			default: PTP_SUBDOMAIN_DEFAULT,
+			isVisibleExpression: `$(options:version) == 'ptpv1'`,
 		},
 		{
 			type: 'number',

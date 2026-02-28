@@ -3,7 +3,7 @@
 	"id": "generic-ptpv2-client",
 	"name": "generic-ptpv2-client",
 	"shortname": "PTPv2 Client",
-	"description": "Monitor PTPv2 on your network",
+	"description": "Monitor PTPv1 & v2 on your network",
 	"version": "0.0.0",
 	"license": "MIT",
 	"repository": "git+https://github.com/bitfocus/companion-module-generic-ptpv2-client.git",
@@ -22,6 +22,6 @@
 	},
 	"legacyIds": [],
 	"manufacturer": "Generic",
-	"products": ["PTP v2"],
-	"keywords": ["Precision Time Protocol", "IEEE 1588-2008"]
+	"products": ["PTP v1", "PTP v2"],
+	"keywords": ["Precision Time Protocol", "IEEE 1588-2008", "IEEE 1588-2002"]
 }

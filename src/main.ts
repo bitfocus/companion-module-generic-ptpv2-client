@@ -4,11 +4,12 @@ import { UpdateVariableDefinitions } from './variables.js'
 import { UpgradeScripts } from './upgrades.js'
 import { UpdateActions } from './actions.js'
 import { UpdateFeedbacks } from './feedbacks.js'
+import { PTPv1Client } from './ptpv1.js'
 import { PTPv2Client } from './ptpv2.js'
 import { StatusManager } from './status.js'
 export class ModuleInstance extends InstanceBase<ModuleConfig> {
 	config!: ModuleConfig // Setup in init()
-	client!: PTPv2Client
+	client!: PTPv1Client | PTPv2Client
 	statusManager = new StatusManager(this)
 	constructor(internal: unknown) {
 		super(internal)
@@ -35,7 +36,13 @@ export class ModuleInstance extends InstanceBase<ModuleConfig> {
 
 		if (config.interface) {
 			try {
-				this.client = new PTPv2Client(config.interface, config.domain, config.interval)
+				switch (config.version) {
+					case 'ptpv1':
+						this.client = new PTPv1Client(config.interface, config.subdomain, config.interval)
+						break
+					case 'ptpv2':
+						this.client = new PTPv2Client(config.interface, config.domain, config.interval)
+				}
 				this.listenForClientEvents()
 				this.getVarValues()
 				this.statusManager.updateStatus(InstanceStatus.Ok)
@@ -50,7 +57,7 @@ export class ModuleInstance extends InstanceBase<ModuleConfig> {
 
 	private listenForClientEvents(): void {
 		this.client.on('ptp_master_changed', (ptp_master, master_address, sync) => {
-			this.log('info', `PTPv2 Master Changed: ${ptp_master} Address: ${master_address}`)
+			this.log('info', `PTP Master Changed: ${ptp_master} Address: ${master_address}`)
 			this.log(sync ? 'info' : 'warn', `PTP Sync Changed. ${sync ? 'Locked' : 'Unlocked'}`)
 			this.checkFeedbacks()
 			this.setVariableValues({ ptpMaster: ptp_master, ptpMasterAddress: master_address })

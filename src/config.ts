@@ -63,6 +63,7 @@ const ptpv1MulticastFields = (): SomeCompanionConfigField[] =>
 	}))
 
 export function GetConfigFields(): SomeCompanionConfigField[] {
+	const isLinuxUser = os.platform() === 'linux' && os.userInfo().username !== 'root'
 	const interfaces = os.networkInterfaces()
 	const localNics: DropdownChoice[] = []
 	const interface_names = Object.keys(interfaces)
@@ -132,6 +133,14 @@ export function GetConfigFields(): SomeCompanionConfigField[] {
 			min: 125,
 			max: 30000,
 			default: 10000,
+		},
+		{
+			type: 'static-text',
+			id: 'linuxPrivilegedPortWarning',
+			label: 'Privileged Port Warning',
+			value: `This module will attempt to bind to privileged ports 319 & 320, which requires elevated permissions on Linux. Since you are not running as <code>root</code>, you may need to grant the Node.js binary the <code>CAP_NET_BIND_SERVICE</code> capability. You can do this with <strong>setcap</strong> or <strong>authbind</strong>.`,
+			width: 12,
+			isVisibleExpression: `${isLinuxUser}`,
 		},
 	]
 }

@@ -421,7 +421,7 @@ export class PTPv1Client extends EventEmitter<PTPv1ClientEvents> {
 	 */
 	public get ptp_time_ns(): bigint {
 		const [s, ns] = this.ptp_time
-		return BigInt(s) * 1_000_000_000n + BigInt(ns)
+		return BigInt(s) * 1_000_000_000n + BigInt(Math.round(ns))
 	}
 
 	/** The configured subdomain name this client is listening on. */

@@ -374,7 +374,7 @@ export class PTPv2Client extends EventEmitter<PTPv2ClientEvents> {
 	 */
 	public get ptp_time_ns(): bigint {
 		const [s, ns] = this.ptp_time
-		return BigInt(s) * 1_000_000_000n + BigInt(ns)
+		return BigInt(s) * 1_000_000_000n + BigInt(Math.round(ns))
 	}
 
 	/**

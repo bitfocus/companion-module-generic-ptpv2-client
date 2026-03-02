@@ -164,7 +164,7 @@ export class PTPv2Client extends EventEmitter<PTPv2ClientEvents> {
 			if ((flags & 0x0200) == 0x0200) {
 				//two step, wait for follow_up msg for accurate t1
 				this.ts1 = recv_ts
-			} else if (Date.now() - this.lastSync > this.minSyncInterval) {
+			} else if (Date.now() - this.lastSync >= this.minSyncInterval) {
 				if (buffer.length < 44) return
 				//got accurate t1 (no follow_up msg)
 				this.ts1 = recv_ts
@@ -205,7 +205,7 @@ export class PTPv2Client extends EventEmitter<PTPv2ClientEvents> {
 			this.addDomain(domain)
 			//check for version 2 and domain
 			if (version != 2 || domain != this.ptp_domain || buffer.length < 44) return
-			if (type == 0x08 && this.sync_seq == sequence && Date.now() - this.lastSync > this.minSyncInterval) {
+			if (type == 0x08 && this.sync_seq == sequence && Date.now() - this.lastSync >= this.minSyncInterval) {
 				//follow up msg with current seq
 				// FIX: use * 2^32 instead of << 4 to correctly combine the 48-bit seconds field
 				const tsS = buffer.readUInt16BE(34) * 4294967296 + buffer.readUInt32BE(36)
@@ -303,7 +303,7 @@ export class PTPv2Client extends EventEmitter<PTPv2ClientEvents> {
 		if (this.syncTimeout) clearTimeout(this.syncTimeout)
 		this.syncTimeout = setTimeout(() => {
 			this.sync_change(false)
-		}, this.minSyncInterval * 2)
+		}, this.minSyncInterval * 4)
 	}
 
 	/**

@@ -275,7 +275,7 @@ export class PTPv1Client extends EventEmitter<PTPv1ClientEvents> {
 			if ((flags & FLAG_ASSIST) === FLAG_ASSIST) {
 				// Two-step clock: Follow_Up will carry the precise t1
 				this.ts1 = recv_ts
-			} else if (Date.now() - this.lastSync > this.minSyncInterval) {
+			} else if (Date.now() - this.lastSync >= this.minSyncInterval) {
 				// One-step clock: timestamp is embedded in the Sync message
 				if (buffer.length < 40) return
 				this.ts1 = recv_ts
@@ -320,7 +320,7 @@ export class PTPv1Client extends EventEmitter<PTPv1ClientEvents> {
 			if (
 				msgType === MSG_FOLLOW_UP &&
 				sequence === this.sync_seq &&
-				Date.now() - this.lastSync > this.minSyncInterval
+				Date.now() - this.lastSync >= this.minSyncInterval
 			) {
 				// Precise master send timestamp from the Follow_Up message
 				const tsS = buffer.readUInt32BE(32)
@@ -473,7 +473,7 @@ export class PTPv1Client extends EventEmitter<PTPv1ClientEvents> {
 		if (this.syncTimeout) clearTimeout(this.syncTimeout)
 		this.syncTimeout = setTimeout(() => {
 			this.sync_change(false)
-		}, this.minSyncInterval * 2)
+		}, this.minSyncInterval * 4)
 	}
 
 	private addSubdomain(name: string): void {

@@ -314,7 +314,7 @@ export class PTPv2Client extends EventEmitter<PTPv2ClientEvents> {
 	private addDomain(domain: number): void {
 		if (this.domainsFound.has(domain)) return
 		this.domainsFound.add(domain)
-		this.emit(`domains`, this.domainsFound.values())
+		this.emit('domains', this.domainsFound.values())
 	}
 
 	/**

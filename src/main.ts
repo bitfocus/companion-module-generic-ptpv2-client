@@ -76,12 +76,15 @@ export class ModuleInstance extends InstanceBase<ModuleConfig> {
 			const syncTime = new Date(lastSync)
 			this.log('debug', `Time Synced ${time}. Timestamp of sync: ${syncTime.toISOString()}`)
 			this.setVariableValues({ ptpTimeS: time[0], ptpTimeNS: time[1], lastSync: syncTime.toISOString() })
-			this.checkFeedbacks(FeedbackId.PtpTimeNs, FeedbackId.Domains)
+			this.checkFeedbacks(FeedbackId.PtpTimeNs)
 			this.statusManager.updateStatus(InstanceStatus.Ok)
 		})
 		this.client.on('sync_changed', (sync) => {
 			this.log(sync ? 'info' : 'warn', `PTP Sync Changed. ${sync ? 'Locked' : 'Unlocked'}`)
-			this.checkFeedbacks(FeedbackId.IsSynced, FeedbackId.PtpTimeNs, FeedbackId.Domains)
+			this.checkFeedbacks(FeedbackId.IsSynced, FeedbackId.PtpTimeNs)
+		})
+		this.client.on('domains', () => {
+			this.checkFeedbacks(FeedbackId.Domains)
 		})
 		this.client.on('error', (err) => {
 			this.statusManager.updateStatus(InstanceStatus.UnknownError)

@@ -35,8 +35,7 @@ export const DANTE_SUBDOMAIN_PULLUP_01 = PTP_SUBDOMAIN_ALT2
 export const DANTE_SUBDOMAIN_PULLDOWN_01 = PTP_SUBDOMAIN_ALT3
 export const DANTE_SUBDOMAIN_PULLDOWN_48 = PTP_SUBDOMAIN_ALT4
 
-// PTPv1 (IEEE 1588-2002) uses a four multicast addresses for all subdomains.
-
+// PTPv1 (IEEE 1588-2002) uses four multicast addresses for all subdomains.
 export const PTP_MULTICAST = {
 	[PTP_SUBDOMAIN_DEFAULT]: '224.0.1.129',
 	[PTP_SUBDOMAIN_ALT1]: '224.0.1.130',
@@ -45,41 +44,43 @@ export const PTP_MULTICAST = {
 	[PTP_SUBDOMAIN_ALT4]: '224.0.1.131',
 } as const satisfies Record<PTP_SUBDOMAINS, string>
 
-// Use for peer delay messages: Pdelay_Req, Pdelay_Resp and Pdelay_Resp_Follow_U
+// Use for peer delay messages: Pdelay_Req, Pdelay_Resp and Pdelay_Resp_Follow_Up
 export const PEER_DELAY_ADDRESS = '224.0.0.107'
 
-// PTPv1 message types (byte 16 of header)
+// PTPv1 message types (byte 20 of header)
 const MSG_SYNC = 0x01
 const MSG_DELAY_REQ = 0x02
 const MSG_FOLLOW_UP = 0x03
 const MSG_DELAY_RESP = 0x04
 
-// PTPv1 control field values (byte 28 of header)
+// PTPv1 control field values (byte 32 of header)
 export const CTRL_SYNC = 0x00
 export const CTRL_DELAY_REQ = 0x01
 export const CTRL_FOLLOW_UP = 0x02
 export const CTRL_DELAY_RSP = 0x03
 
-// PTPv1 flags (uint16 BE at byte 30):
+// PTPv1 flags (uint16 BE at byte 34):
 // Bit 3 is PTP_ASSIST — set by a two-step master to indicate a Follow_Up will follow.
 const FLAG_ASSIST = 0x0008
 
 // ---------------------------------------------------------------------------
-// PTPv1 header layout (32 bytes)
+// PTPv1 header layout (36 bytes)
 // ---------------------------------------------------------------------------
-//  0–15 : subdomain name (null-padded ASCII, 16 bytes)
-//    16  : messageType
-//    17  : sourceCommunicationTechnology
-// 18–23  : sourceUuid (6 bytes)
-// 24–25  : sourcePortId (uint16 BE)
-// 26–27  : sequenceId  (uint16 BE)
-//    28  : control
-//    29  : reserved
-// 30–31  : flags (uint16 BE)
+// Bytes  0–1  : versionPTP      (uint16 BE, value = 1)
+// Bytes  2–3  : versionNetwork  (uint16 BE)
+// Bytes  4–19 : subdomain name  (16 bytes, null-terminated, null-padded)
+// Byte   20   : messageType
+// Byte   21   : sourceCommunicationTechnology
+// Bytes 22–27 : sourceUuid      (6 bytes)
+// Bytes 28–29 : sourcePortId    (uint16 BE)
+// Bytes 30–31 : sequenceId      (uint16 BE)
+// Byte   32   : control
+// Byte   33   : reserved
+// Bytes 34–35 : flags           (uint16 BE)
 //
-// For Sync, Follow_Up, and Delay_Resp the body begins at byte 32:
-//   32–35 : timestamp seconds      (uint32 BE)
-//   36–39 : timestamp nanoseconds  (int32  BE — signed per spec)
+// For Sync, Follow_Up, and Delay_Resp the body begins at byte 36:
+//   36–39 : timestamp seconds      (uint32 BE)
+//   40–43 : timestamp nanoseconds  (int32  BE — signed per spec)
 // ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
@@ -114,17 +115,21 @@ const encodeSubdomain = (name: string): Buffer => {
 }
 
 /**
- * Decode the subdomain name from the first 16 bytes of a PTPv1 packet,
- * trimming trailing null bytes.
+ * Decode the null-terminated subdomain name from bytes 4–19 of a PTPv1 packet.
+ * Reads up to the first null byte, which is how null-terminated strings work per spec.
  */
-const decodeSubdomain = (buffer: Buffer): string => buffer.toString('ascii', 0, 16).replace(/\0+$/, '')
+const decodeSubdomain = (buffer: Buffer): string => {
+	const nullIdx = buffer.indexOf(0, 4)
+	const end = nullIdx === -1 ? 20 : Math.min(nullIdx, 20)
+	return buffer.toString('ascii', 4, end)
+}
 
 /**
  * Format a PTPv1 source identity as "uuid0-uuid1-...-uuid5:portId"
  */
 const formatSourceId = (buffer: Buffer): string => {
-	const uuidBytes = buffer.toString('hex', 18, 24).match(/.{1,2}/g) ?? []
-	const portId = buffer.readUInt16BE(24)
+	const uuidBytes = buffer.toString('hex', 22, 28).match(/.{1,2}/g) ?? []
+	const portId = buffer.readUInt16BE(28)
 	return uuidBytes.join('-') + ':' + portId
 }
 
@@ -140,6 +145,7 @@ export interface PTPv1ClientEvents {
 	ptp_master_changed: [ptp_master: string, address: string, sync: boolean]
 	ptp_time_synced: [time: PtpTime, lastSync: number]
 	sync_changed: [sync: boolean]
+	domains: [domains: SetIterator<string>]
 }
 
 // ---------------------------------------------------------------------------
@@ -151,16 +157,16 @@ export interface PTPv1ClientEvents {
  *
  * Key differences from PTPv2:
  *  - All subdomain filtering is performed by matching the 16-byte subdomain name field in
- *    the packet header.
+ *    the packet header (bytes 4–19, following the 4-byte version preamble).
  *  - Message types are different: Sync=0x01, Delay_Req=0x02,
  *    Follow_Up=0x03, Delay_Resp=0x04.
- *  - The two-step flag is PTP_ASSIST (bit 3 of the flags word), not 0x0200.
+ *  - The two-step flag is PTP_ASSIST (bit 3 of the flags word at byte 34), not 0x0200.
  *  - Timestamps are 32-bit seconds + signed 32-bit nanoseconds (not 48-bit).
  *  - Source identity is a 6-byte UUID + 2-byte port ID (not a clock identity).
  *  - Domain is expressed as a subdomain name string, not a number.
  *
  * @author Phillip Ivan Pietruschka <ivanpietruschka@gmail.com>
- * @since Feburary, 2026
+ * @since February, 2026
  */
 export class PTPv1Client extends EventEmitter<PTPv1ClientEvents> {
 	// settings
@@ -246,19 +252,20 @@ export class PTPv1Client extends EventEmitter<PTPv1ClientEvents> {
 		this.ptpClientEvent.on('message', (buffer, rinfo): void => {
 			const recv_ts = getCorrectedTime(this.offset)
 
-			if (buffer.length < 32) return
+			// Minimum header size: 36 bytes (4 version + 16 subdomain + 16 header fields)
+			if (buffer.length < 36) return
 
-			const msgType = buffer.readUInt8(16)
-			const sequence = buffer.readUInt16BE(26)
-			const flags = buffer.readUInt16BE(30)
+			const msgType = buffer.readUInt8(20)
+			const sequence = buffer.readUInt16BE(30)
+			const flags = buffer.readUInt16BE(34)
 
 			// Track all subdomains seen on the wire regardless of our own filter
 			const pktSubdomain = decodeSubdomain(buffer)
-			this.addSubdomain(pktSubdomain)
+			if (pktSubdomain) this.addSubdomain(pktSubdomain)
 
 			// Only process Sync messages for our configured subdomain
 			if (msgType !== MSG_SYNC) return
-			if (!buffer.subarray(0, 16).equals(this.subdomainBuf)) return
+			if (!buffer.subarray(4, 20).equals(this.subdomainBuf)) return
 
 			const source = formatSourceId(buffer)
 
@@ -277,13 +284,14 @@ export class PTPv1Client extends EventEmitter<PTPv1ClientEvents> {
 				this.ts1 = recv_ts
 			} else if (Date.now() - this.lastSync >= this.minSyncInterval) {
 				// One-step clock: timestamp is embedded in the Sync message
-				if (buffer.length < 40) return
+				// Need 44 bytes: 36 header + 8 timestamp bytes
+				if (buffer.length < 44) return
 				this.ts1 = recv_ts
 
 				// PTPv1 uses 32-bit seconds (not 48-bit like PTPv2)
-				const tsS = buffer.readUInt32BE(32)
+				const tsS = buffer.readUInt32BE(36)
 				// Nanoseconds are signed int32 per IEEE 1588-2002
-				const tsNS = buffer.readInt32BE(36)
+				const tsNS = buffer.readInt32BE(40)
 				this.t1 = normalizePtpTime(tsS, tsNS)
 
 				setImmediate(() => {
@@ -302,20 +310,22 @@ export class PTPv1Client extends EventEmitter<PTPv1ClientEvents> {
 		// General socket (port 320): receives Follow_Up and Delay_Resp messages
 		// -----------------------------------------------------------------------
 		this.ptpClientGeneral.on('message', (buffer, _rinfo): void => {
-			if (buffer.length < 32) return
+			// Minimum header size: 36 bytes
+			if (buffer.length < 36) return
 
-			const msgType = buffer.readUInt8(16)
-			const sequence = buffer.readUInt16BE(26)
+			const msgType = buffer.readUInt8(20)
+			const sequence = buffer.readUInt16BE(30)
 
 			// Track subdomains regardless of filter
 			const pktSubdomain = decodeSubdomain(buffer)
-			this.addSubdomain(pktSubdomain)
+			if (pktSubdomain) this.addSubdomain(pktSubdomain)
 
 			// All general messages we care about need the timestamp fields
-			if (buffer.length < 40) return
+			// Need 44 bytes: 36 header + 8 timestamp bytes
+			if (buffer.length < 44) return
 
 			// Only process messages for our configured subdomain
-			if (!buffer.subarray(0, 16).equals(this.subdomainBuf)) return
+			if (!buffer.subarray(4, 20).equals(this.subdomainBuf)) return
 
 			if (
 				msgType === MSG_FOLLOW_UP &&
@@ -323,8 +333,8 @@ export class PTPv1Client extends EventEmitter<PTPv1ClientEvents> {
 				Date.now() - this.lastSync >= this.minSyncInterval
 			) {
 				// Precise master send timestamp from the Follow_Up message
-				const tsS = buffer.readUInt32BE(32)
-				const tsNS = buffer.readInt32BE(36)
+				const tsS = buffer.readUInt32BE(36)
+				const tsNS = buffer.readInt32BE(40)
 				this.t1 = normalizePtpTime(tsS, tsNS)
 
 				setImmediate(() => {
@@ -338,8 +348,8 @@ export class PTPv1Client extends EventEmitter<PTPv1ClientEvents> {
 				})
 			} else if (msgType === MSG_DELAY_RESP && sequence === this.req_seq) {
 				// Master's receive timestamp for our Delay_Req
-				const tsS = buffer.readUInt32BE(32)
-				const tsNS = buffer.readInt32BE(36)
+				const tsS = buffer.readUInt32BE(36)
+				const tsNS = buffer.readInt32BE(40)
 				this.ts2 = normalizePtpTime(tsS, tsNS)
 
 				// Offset calculation: delta = ((ts1 - t1) - (ts2 - t2)) / 2
@@ -442,29 +452,32 @@ export class PTPv1Client extends EventEmitter<PTPv1ClientEvents> {
 	 * Build a PTPv1 Delay_Req packet.
 	 *
 	 * Structure:
-	 *   Bytes  0–15 : subdomain name
-	 *   Byte  16    : messageType = 0x02
-	 *   Byte  17    : sourceCommunicationTechnology = 0 (unknown)
-	 *   Bytes 18–23 : sourceUuid (zeroed — we are a slave with no UUID)
-	 *   Bytes 24–25 : sourcePortId (zeroed)
-	 *   Bytes 26–27 : sequenceId
-	 *   Byte  28    : control = 0x01
-	 *   Byte  29    : reserved
-	 *   Bytes 30–31 : flags (zeroed)
-	 *   Bytes 32–35 : originTimestamp.seconds (zeroed)
-	 *   Bytes 36–39 : originTimestamp.nanoseconds (zeroed)
-	 *   ... remainder of body zeroed to 44 bytes total
+	 *   Bytes  0–1  : versionPTP = 1       (uint16 BE)
+	 *   Bytes  2–3  : versionNetwork = 1   (uint16 BE)
+	 *   Bytes  4–19 : subdomain name       (16 bytes, null-padded)
+	 *   Byte   20   : messageType = 0x02
+	 *   Byte   21   : sourceCommunicationTechnology = 0 (unknown)
+	 *   Bytes 22–27 : sourceUuid           (zeroed — we are a slave with no UUID)
+	 *   Bytes 28–29 : sourcePortId         (zeroed)
+	 *   Bytes 30–31 : sequenceId           (uint16 BE)
+	 *   Byte   32   : control = 0x01
+	 *   Byte   33   : reserved
+	 *   Bytes 34–35 : flags                (zeroed)
+	 *   Bytes 36–39 : originTimestamp.seconds     (zeroed)
+	 *   Bytes 40–43 : originTimestamp.nanoseconds (zeroed)
 	 */
 	private ptp_delay_req(): Buffer {
 		const length = 44
 		const buffer = Buffer.alloc(length, 0)
 		this.req_seq = (this.req_seq + 1) % 0x10000
 
-		this.subdomainBuf.copy(buffer, 0) // subdomain name
-		buffer.writeUInt8(MSG_DELAY_REQ, 16) // messageType
-		buffer.writeUInt8(0x00, 17) // sourceCommunicationTechnology (unknown)
-		buffer.writeUInt16BE(this.req_seq, 26) // sequenceId
-		buffer.writeUInt8(CTRL_DELAY_REQ, 28) // control
+		buffer.writeUInt16BE(1, 0) // versionPTP
+		buffer.writeUInt16BE(1, 2) // versionNetwork
+		this.subdomainBuf.copy(buffer, 4) // subdomain name (bytes 4–19)
+		buffer.writeUInt8(MSG_DELAY_REQ, 20) // messageType
+		buffer.writeUInt8(0x00, 21) // sourceCommunicationTechnology
+		buffer.writeUInt16BE(this.req_seq, 30) // sequenceId
+		buffer.writeUInt8(CTRL_DELAY_REQ, 32) // control
 
 		return buffer
 	}
@@ -479,7 +492,7 @@ export class PTPv1Client extends EventEmitter<PTPv1ClientEvents> {
 	private addSubdomain(name: string): void {
 		if (this.subdomainsFound.has(name)) return
 		this.subdomainsFound.add(name)
-		this.emit('subdomains', this.subdomainsFound.values())
+		this.emit('domains', this.subdomainsFound.values())
 	}
 
 	private sync_change(sync: boolean): void {

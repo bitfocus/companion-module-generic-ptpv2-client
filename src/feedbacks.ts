@@ -1,9 +1,15 @@
-import { combineRgb } from '@companion-module/base'
+import { combineRgb, CompanionFeedbackDefinition } from '@companion-module/base'
 import type { ModuleInstance } from './main.js'
 import { PTPv1Client } from './ptpv1.js'
 
+export enum FeedbackId {
+	IsSynced = 'isSynced',
+	Domains = 'domains',
+	PtpTimeNs = 'ptpTimeNs',
+}
+
 export function UpdateFeedbacks(self: ModuleInstance): void {
-	self.setFeedbackDefinitions({
+	const feedbacks: Record<FeedbackId, CompanionFeedbackDefinition> = {
 		isSynced: {
 			name: 'PTP Synced',
 			type: 'boolean',
@@ -35,5 +41,6 @@ export function UpdateFeedbacks(self: ModuleInstance): void {
 				return self.client.ptp_time_ns.toString()
 			},
 		},
-	})
+	}
+	self.setFeedbackDefinitions(feedbacks)
 }

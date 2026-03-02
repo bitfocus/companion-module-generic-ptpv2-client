@@ -3,14 +3,20 @@ import { GetConfigFields, type ModuleConfig } from './config.js'
 import { UpdateVariableDefinitions } from './variables.js'
 import { UpgradeScripts } from './upgrades.js'
 import { UpdateActions } from './actions.js'
-import { UpdateFeedbacks } from './feedbacks.js'
+import { UpdateFeedbacks, FeedbackId } from './feedbacks.js'
 import { PTPv1Client } from './ptpv1.js'
 import { PTPv2Client } from './ptpv2.js'
 import { StatusManager } from './status.js'
+
 export class ModuleInstance extends InstanceBase<ModuleConfig> {
 	config!: ModuleConfig // Setup in init()
 	client!: PTPv1Client | PTPv2Client
 	statusManager = new StatusManager(this)
+
+	public checkFeedbacks(...feedbackTypes: FeedbackId[]): void {
+		super.checkFeedbacks(...(feedbackTypes as [FeedbackId]))
+	}
+
 	constructor(internal: unknown) {
 		super(internal)
 	}
@@ -63,27 +69,30 @@ export class ModuleInstance extends InstanceBase<ModuleConfig> {
 		this.client.on('ptp_master_changed', (ptp_master, master_address, sync) => {
 			this.log('info', `PTP Master Changed: ${ptp_master} Address: ${master_address}`)
 			this.log(sync ? 'info' : 'warn', `PTP Sync Changed. ${sync ? 'Locked' : 'Unlocked'}`)
-			this.checkFeedbacks()
 			this.setVariableValues({ ptpMaster: ptp_master, ptpMasterAddress: master_address })
+			this.checkFeedbacks(FeedbackId.IsSynced)
 		})
 		this.client.on('ptp_time_synced', (time, lastSync) => {
 			const syncTime = new Date(lastSync)
 			this.log('debug', `Time Synced ${time}. Timestamp of sync: ${syncTime.toISOString()}`)
 			this.setVariableValues({ ptpTimeS: time[0], ptpTimeNS: time[1], lastSync: syncTime.toISOString() })
+			this.checkFeedbacks(FeedbackId.PtpTimeNs, FeedbackId.Domains)
 			this.statusManager.updateStatus(InstanceStatus.Ok)
 		})
 		this.client.on('sync_changed', (sync) => {
 			this.log(sync ? 'info' : 'warn', `PTP Sync Changed. ${sync ? 'Locked' : 'Unlocked'}`)
-			this.checkFeedbacks()
+			this.checkFeedbacks(FeedbackId.IsSynced, FeedbackId.PtpTimeNs, FeedbackId.Domains)
 		})
 		this.client.on('error', (err) => {
 			this.statusManager.updateStatus(InstanceStatus.UnknownError)
 			this.log('warn', `Error: ${JSON.stringify(err)}`)
+			this.checkFeedbacks(FeedbackId.IsSynced, FeedbackId.PtpTimeNs)
 		})
 
 		this.client.on('close', (msg) => {
 			this.log('warn', msg)
 			this.statusManager.updateStatus(InstanceStatus.Disconnected)
+			this.checkFeedbacks(FeedbackId.IsSynced, FeedbackId.PtpTimeNs)
 		})
 		this.client.on('listening', (msg) => {
 			this.log('info', msg)
@@ -105,7 +114,7 @@ export class ModuleInstance extends InstanceBase<ModuleConfig> {
 			ptpMaster: ptp_master[0],
 			ptpMasterAddress: ptp_master[1],
 		})
-		this.checkFeedbacks()
+		this.checkFeedbacks(FeedbackId.IsSynced, FeedbackId.PtpTimeNs, FeedbackId.Domains)
 	}
 
 	// Return config fields for web config

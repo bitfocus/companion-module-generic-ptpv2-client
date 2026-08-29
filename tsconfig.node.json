@@ -1,8 +1,0 @@
-{
-	"compilerOptions": {
-		"module": "ESNext",
-		"moduleResolution": "bundler",
-		"composite": true
-	},
-	"include": ["vitest.config.ts", "vite.config.ts"]
-}

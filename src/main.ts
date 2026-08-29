@@ -82,8 +82,10 @@ export default class ModuleInstance extends InstanceBase<ModuleSchema> {
 			this.checkFeedbacks(FeedbackIDs.IsSynced)
 		})
 		this.client.on('error', (err) => {
-			this.statusManager.updateStatus(InstanceStatus.UnknownError)
-			this.log('warn', `Error: ${JSON.stringify(err)}`)
+			this.statusManager.updateStatus(InstanceStatus.UnknownError, err.message)
+			// Error has no enumerable own properties, so JSON.stringify would render every
+			// real socket failure as '{}'
+			this.log('warn', `Error: ${err.message}`)
 		})
 
 		this.client.on('close', (msg) => {
@@ -104,6 +106,7 @@ export default class ModuleInstance extends InstanceBase<ModuleSchema> {
 		this.setVariableValues({
 			ptpTimeS: this.client.last_sync == 0 ? undefined : time[0],
 			ptpTimeNS: this.client.last_sync == 0 ? undefined : time[1],
+			ptpTime: this.client.last_sync == 0 ? undefined : this.client.ptp_time_n.toString(),
 			lastSync: this.client.last_sync == 0 ? '' : syncTime.toISOString(),
 			ptpMaster: ptp_master[0],
 			ptpMasterAddress: ptp_master[1],

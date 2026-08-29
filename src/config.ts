@@ -8,6 +8,7 @@ export type ModuleConfig = {
 }
 
 export function GetConfigFields(): SomeCompanionConfigField[] {
+	const isLinuxUser = os.platform() === 'linux' && os.userInfo().username !== 'root'
 	const interfaces = os.networkInterfaces()
 	const localNics: DropdownChoice[] = []
 	const interface_names = Object.keys(interfaces)
@@ -47,6 +48,14 @@ export function GetConfigFields(): SomeCompanionConfigField[] {
 			min: 125,
 			max: 30000,
 			default: 10000,
+		},
+		{
+			type: 'static-text',
+			id: 'linuxPrivilegedPortWarning',
+			label: 'Privileged Port Warning',
+			value: `This module will attempt to bind to privileged ports 319 and 320, which requires elevated permissions on Linux. You may need to grant the Node.js binary the <code>CAP_NET_BIND_SERVICE</code> capability. You can do this with one of the following tools: <strong>setcap</strong>, <strong>authbind</strong>.`,
+			width: 12,
+			isVisibleExpression: `${isLinuxUser}`,
 		},
 	]
 }

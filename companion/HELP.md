@@ -17,5 +17,6 @@ Module will report sync loss after twice the Sync interval duration without a sy
 - PTP Master (Address)
 - PTP Time (s)
 - PTP Time (ns)
+- PTP Time
 
 PTP Time variables updated each sync event.

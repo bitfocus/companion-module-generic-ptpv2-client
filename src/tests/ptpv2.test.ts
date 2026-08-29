@@ -20,7 +20,9 @@ class MockSocket {
 		// fire 'listening' asynchronously to match real dgram behaviour
 		setImmediate(() => this.emit('listening'))
 	})
-	addMembership = vi.fn()
+	addMembership = vi.fn(() => {
+		if (addMembershipError) throw addMembershipError
+	})
 	send = vi.fn((_buf: Buffer, _port: number, _addr: string, cb?: (err: Error | null) => void) => {
 		cb?.(null)
 	})
@@ -42,6 +44,8 @@ class MockSocket {
 
 // Two sockets are created in order: event (port 319) then general (port 320).
 let mockSockets: MockSocket[] = []
+// When set, every addMembership() call throws it — simulates the interface going away
+let addMembershipError: Error | undefined
 
 vi.mock('dgram', () => ({
 	default: {
@@ -118,7 +122,19 @@ const makeSyncBuffer = ({
 
 const makeFollowUpBuffer = (opts: Parameters<typeof makeSyncBuffer>[0] = {}) => makeSyncBuffer({ ...opts, type: 0x08 })
 
-const makeDelayRespBuffer = (opts: Parameters<typeof makeSyncBuffer>[0] = {}) => makeSyncBuffer({ ...opts, type: 0x09 })
+/**
+ * Build a Delay_Resp. A real one is 54 bytes and echoes the requesting slave's portIdentity
+ * (8-byte clockIdentity + 2-byte portNumber) at bytes 44-53; the client ignores any response
+ * that isn't stamped with its own, so tests must supply the client the response is for.
+ */
+const makeDelayRespBuffer = (
+	requester: { clock_identity: string } | undefined,
+	opts: Parameters<typeof makeSyncBuffer>[0] = {},
+): Buffer => {
+	const buf = makeSyncBuffer({ ...opts, type: 0x09, length: 54 })
+	if (requester) Buffer.from(requester.clock_identity + '0001', 'hex').copy(buf, 44)
+	return buf
+}
 
 // Fake rinfo object
 const rinfo = { address: '192.168.1.1', family: 'IPv4', port: 319, size: 44 }
@@ -145,6 +161,7 @@ const makeClient = async (iface = '0.0.0.0', domain = 0, interval = 125) => {
 // ---------------------------------------------------------------------------
 beforeEach(() => {
 	mockSockets = []
+	addMembershipError = undefined
 	vi.clearAllMocks()
 })
 
@@ -174,9 +191,9 @@ describe('constructor – iface validation', () => {
 
 	it('uses 0.0.0.0 as default when no iface is supplied', async () => {
 		const client = await makeClient()
-		// bind should have been called with '0.0.0.0'
-		expect(eventSocket().bind).toHaveBeenCalledWith(319, '0.0.0.0')
-		expect(generalSocket().bind).toHaveBeenCalledWith(320, '0.0.0.0')
+		// The default interface shows up in the group join, not in bind()
+		expect(eventSocket().addMembership).toHaveBeenCalledWith('224.0.1.129', '0.0.0.0')
+		expect(generalSocket().addMembership).toHaveBeenCalledWith('224.0.1.129', '0.0.0.0')
 		client.destroy()
 	})
 
@@ -294,15 +311,25 @@ describe('constructor – interval parameter', () => {
 // Socket bind addresses
 // ===========================================================================
 describe('socket bind addresses', () => {
-	it('binds event socket to port 319 on the supplied address', async () => {
+	// A socket bound to a specific unicast address does not receive datagrams addressed to
+	// a multicast group, so both sockets must bind INADDR_ANY and let addMembership pick
+	// the interface. Binding to the configured NIC address here would receive nothing.
+	it('binds event socket to port 319 on all interfaces', async () => {
 		const client = await makeClient('10.0.0.1')
-		expect(eventSocket().bind).toHaveBeenCalledWith(319, '10.0.0.1')
+		expect(eventSocket().bind).toHaveBeenCalledWith(319)
 		client.destroy()
 	})
 
-	it('binds general socket to port 320 on the supplied address', async () => {
+	it('binds general socket to port 320 on all interfaces', async () => {
 		const client = await makeClient('10.0.0.1')
-		expect(generalSocket().bind).toHaveBeenCalledWith(320, '10.0.0.1')
+		expect(generalSocket().bind).toHaveBeenCalledWith(320)
+		client.destroy()
+	})
+
+	it('selects the configured interface via addMembership rather than bind', async () => {
+		const client = await makeClient('10.0.0.1')
+		expect(eventSocket().addMembership).toHaveBeenCalledWith('224.0.1.129', '10.0.0.1')
+		expect(generalSocket().addMembership).toHaveBeenCalledWith('224.0.1.129', '10.0.0.1')
 		client.destroy()
 	})
 })
@@ -311,12 +338,22 @@ describe('socket bind addresses', () => {
 // destroy()
 // ===========================================================================
 describe('destroy()', () => {
-	it('emits sync_changed false', async () => {
+	it('does not emit sync_changed when it was never synced', async () => {
 		const client = await makeClient()
 		const spy = vi.fn()
 		client.on('sync_changed', spy)
 		client.destroy()
-		expect(spy).toHaveBeenCalledWith(false)
+		// sync was already false, so there is no transition to report
+		expect(spy).not.toHaveBeenCalled()
+	})
+
+	it('is safe to call twice', async () => {
+		const client = await makeClient()
+		const es = eventSocket()
+		client.destroy()
+		client.destroy()
+		// a second close() on a closed socket would throw ERR_SOCKET_DGRAM_NOT_RUNNING
+		expect(es.close).toHaveBeenCalledTimes(1)
 	})
 
 	it('calls close on both sockets', async () => {
@@ -503,7 +540,7 @@ describe('full two-step sync flow', () => {
 		// Step 3: Delay_Resp – provides ts2 and triggers offset calculation
 		generalSocket().emit(
 			'message',
-			makeDelayRespBuffer({
+			makeDelayRespBuffer(client, {
 				sequence: 1, // req_seq starts at 0, incremented to 1 on first send
 				tsSecondsHigh: 0,
 				tsSecondsLow: 1700000000,
@@ -525,7 +562,7 @@ describe('full two-step sync flow', () => {
 		eventSocket().emit('message', makeSyncBuffer({ flags: 0x0200, sequence: 1 }), rinfo)
 		generalSocket().emit('message', makeFollowUpBuffer({ sequence: 1 }), rinfo)
 		await new Promise<void>((r) => setImmediate(r))
-		generalSocket().emit('message', makeDelayRespBuffer({ sequence: 1 }), rinfo)
+		generalSocket().emit('message', makeDelayRespBuffer(client, { sequence: 1 }), rinfo)
 
 		const [s, ns] = client.ptp_time
 		expect(s).toBeGreaterThanOrEqual(0)
@@ -561,7 +598,7 @@ describe('one-step sync flow', () => {
 
 		generalSocket().emit(
 			'message',
-			makeDelayRespBuffer({
+			makeDelayRespBuffer(client, {
 				sequence: 1,
 				tsSecondsHigh: 0,
 				tsSecondsLow: 1700000010,
@@ -607,7 +644,7 @@ describe('FIX: 48-bit timestamp seconds field parsing', () => {
 		await new Promise<void>((r) => setImmediate(r))
 		generalSocket().emit(
 			'message',
-			makeDelayRespBuffer({
+			makeDelayRespBuffer(client, {
 				sequence: 1,
 				tsSecondsHigh: 1,
 				tsSecondsLow: 0,
@@ -643,7 +680,7 @@ describe('FIX: 48-bit timestamp seconds field parsing', () => {
 		await new Promise<void>((r) => setImmediate(r))
 		generalSocket().emit(
 			'message',
-			makeDelayRespBuffer({
+			makeDelayRespBuffer(client, {
 				sequence: 1,
 				tsSecondsHigh: 0xffff,
 				tsSecondsLow: 0xffffffff,
@@ -683,7 +720,7 @@ describe('FIX: ptp_time nanosecond normalisation', () => {
 			await new Promise<void>((r) => setImmediate(r))
 			generalSocket().emit(
 				'message',
-				makeDelayRespBuffer({
+				makeDelayRespBuffer(client, {
 					sequence: 1,
 					tsSecondsHigh: 0,
 					tsSecondsLow: 1700000000 + i,
@@ -729,7 +766,7 @@ describe('FIX: negative delta offset calculation', () => {
 		// ts2 is also large → delta ends up negative
 		generalSocket().emit(
 			'message',
-			makeDelayRespBuffer({
+			makeDelayRespBuffer(client, {
 				sequence: 1,
 				tsSecondsHigh: 0,
 				tsSecondsLow: 1700000011,
@@ -809,7 +846,7 @@ describe('sync_changed events', () => {
 		eventSocket().emit('message', makeSyncBuffer({ flags: 0x0200, sequence: 1 }), rinfo)
 		generalSocket().emit('message', makeFollowUpBuffer({ sequence: 1 }), rinfo)
 		await new Promise<void>((r) => setImmediate(r))
-		generalSocket().emit('message', makeDelayRespBuffer({ sequence: 1 }), rinfo)
+		generalSocket().emit('message', makeDelayRespBuffer(client, { sequence: 1 }), rinfo)
 
 		expect(client.is_synced).toBe(true)
 		client.destroy()
@@ -825,7 +862,7 @@ describe('sync_changed events', () => {
 			eventSocket().emit('message', makeSyncBuffer({ flags: 0x0200, sequence: seq }), rinfo)
 			generalSocket().emit('message', makeFollowUpBuffer({ sequence: seq }), rinfo)
 			await new Promise<void>((r) => setImmediate(r))
-			generalSocket().emit('message', makeDelayRespBuffer({ sequence: seq }), rinfo)
+			generalSocket().emit('message', makeDelayRespBuffer(client, { sequence: seq }), rinfo)
 		}
 
 		// sync_changed(true) should only fire on the transition, not every sync
@@ -840,7 +877,7 @@ describe('sync_changed events', () => {
 		eventSocket().emit('message', makeSyncBuffer({ flags: 0x0200, sequence: 1 }), rinfo)
 		generalSocket().emit('message', makeFollowUpBuffer({ sequence: 1 }), rinfo)
 		await new Promise<void>((r) => setImmediate(r))
-		generalSocket().emit('message', makeDelayRespBuffer({ sequence: 1 }), rinfo)
+		generalSocket().emit('message', makeDelayRespBuffer(client, { sequence: 1 }), rinfo)
 
 		const spy = vi.fn()
 		client.on('sync_changed', spy)
@@ -918,6 +955,188 @@ describe('error propagation', () => {
 		const err = new Error('general socket error')
 		generalSocket().emit('error', err)
 		expect(spy).toHaveBeenCalledWith(err)
+		client.destroy()
+	})
+})
+
+// ===========================================================================
+// FIX: Delay_Resp must be matched to this client
+// ===========================================================================
+describe('FIX: Delay_Resp addressed to another slave', () => {
+	/** Drive a one-step sync so the client has sent a Delay_Req and is awaiting a response */
+	const armExchange = async (client: Awaited<ReturnType<typeof makeClient>>) => {
+		eventSocket().emit('message', makeSyncBuffer({ flags: 0x0000, tsSecondsLow: 1_700_000_000 }), rinfo)
+		await new Promise<void>((r) => setImmediate(r))
+		return client
+	}
+
+	it('ignores a Delay_Resp carrying a different requestingPortIdentity', async () => {
+		const client = await makeClient('0.0.0.0', 0, 125)
+		const timeSpy = vi.fn()
+		client.on('ptp_time_synced', timeSpy)
+		await armExchange(client)
+
+		// Delay_Resp is multicast, so every slave on the network sees every response.
+		// Sequence ids collide across slaves, so the id alone cannot identify ours.
+		generalSocket().emit(
+			'message',
+			makeDelayRespBuffer({ clock_identity: 'deadbeefdeadbeef' }, { sequence: 1, tsSecondsLow: 1_900_000_000 }),
+			rinfo,
+		)
+
+		expect(timeSpy).not.toHaveBeenCalled()
+		expect(client.is_synced).toBe(false)
+		client.destroy()
+	})
+
+	it('ignores a Delay_Resp too short to carry a requestingPortIdentity', async () => {
+		const client = await makeClient('0.0.0.0', 0, 125)
+		const timeSpy = vi.fn()
+		client.on('ptp_time_synced', timeSpy)
+		await armExchange(client)
+
+		generalSocket().emit('message', makeSyncBuffer({ type: 0x09, sequence: 1, length: 44 }), rinfo)
+
+		expect(timeSpy).not.toHaveBeenCalled()
+		expect(client.is_synced).toBe(false)
+		client.destroy()
+	})
+
+	it('accepts a Delay_Resp stamped with our own portIdentity', async () => {
+		const client = await makeClient('0.0.0.0', 0, 125)
+		const timeSpy = vi.fn()
+		client.on('ptp_time_synced', timeSpy)
+		await armExchange(client)
+
+		generalSocket().emit('message', makeDelayRespBuffer(client, { sequence: 1, tsSecondsLow: 1_700_000_000 }), rinfo)
+
+		expect(timeSpy).toHaveBeenCalled()
+		expect(client.is_synced).toBe(true)
+		client.destroy()
+	})
+
+	it('exposes a stable, non-zero clock identity', async () => {
+		const client = await makeClient()
+		expect(client.clock_identity).toMatch(/^[0-9a-f]{16}$/)
+		expect(client.clock_identity).not.toBe('0000000000000000')
+		expect(client.clock_identity).toBe(client.clock_identity)
+		client.destroy()
+	})
+})
+
+// ===========================================================================
+// FIX: Delay_Req rate limiting
+// ===========================================================================
+describe('FIX: Delay_Req is not re-sent for every Sync', () => {
+	it('sends only one Delay_Req for a burst of Syncs with no response', async () => {
+		const client = await makeClient('0.0.0.0', 0, 10000)
+		for (let i = 0; i < 10; i++) {
+			eventSocket().emit('message', makeSyncBuffer({ flags: 0x0000, sequence: i, tsSecondsLow: 1_700_000_000 }), rinfo)
+			await new Promise<void>((r) => setImmediate(r))
+		}
+		// Throttling on the last *attempt* rather than the last success: keyed on success,
+		// an unanswering master produced one Delay_Req per Sync, indefinitely.
+		expect(eventSocket().send).toHaveBeenCalledTimes(1)
+		client.destroy()
+	})
+})
+
+// ===========================================================================
+// FIX: Delay_Req packet format
+// ===========================================================================
+describe('FIX: Delay_Req packet format', () => {
+	const sentDelayReq = async (): Promise<Buffer> => {
+		eventSocket().emit('message', makeSyncBuffer({ flags: 0x0000, tsSecondsLow: 1_700_000_000 }), rinfo)
+		await new Promise<void>((r) => setImmediate(r))
+		return eventSocket().send.mock.calls[0][0]
+	}
+
+	it('is 44 bytes and declares messageLength 44', async () => {
+		const client = await makeClient('0.0.0.0', 0, 125)
+		const buf = await sentDelayReq()
+		expect(buf.length).toBe(44)
+		expect(buf.readUInt16BE(2)).toBe(44)
+		client.destroy()
+	})
+
+	it('carries our sourcePortIdentity so the master can address the response', async () => {
+		const client = await makeClient('0.0.0.0', 0, 125)
+		const buf = await sentDelayReq()
+		expect(buf.toString('hex', 20, 28)).toBe(client.clock_identity)
+		expect(buf.readUInt16BE(28)).toBe(1) // portNumber
+		client.destroy()
+	})
+
+	it('sets controlField and logMessageInterval', async () => {
+		const client = await makeClient('0.0.0.0', 0, 125)
+		const buf = await sentDelayReq()
+		expect(buf.readUInt8(32)).toBe(0x01) // controlField: Delay_Req
+		expect(buf.readUInt8(33)).toBe(0x7f) // logMessageInterval: not periodic
+		client.destroy()
+	})
+})
+
+// ===========================================================================
+// FIX: sync state transitions
+// ===========================================================================
+describe('FIX: sync_changed on master change', () => {
+	it('emits sync_changed false when the master changes while synced', async () => {
+		const client = await makeClient('0.0.0.0', 0, 125)
+		eventSocket().emit('message', makeSyncBuffer({ flags: 0x0000, tsSecondsLow: 1_700_000_000 }), rinfo)
+		await new Promise<void>((r) => setImmediate(r))
+		generalSocket().emit('message', makeDelayRespBuffer(client, { sequence: 1, tsSecondsLow: 1_700_000_000 }), rinfo)
+		expect(client.is_synced).toBe(true)
+
+		const spy = vi.fn()
+		client.on('sync_changed', spy)
+		eventSocket().emit('message', makeSyncBuffer({ flags: 0x0000, source: 'aabbccddeeff0011' }), rinfo)
+
+		expect(spy).toHaveBeenCalledWith(false)
+		expect(client.is_synced).toBe(false)
+		client.destroy()
+	})
+})
+
+// ===========================================================================
+// FIX: addMembership failure must not escape the listening handler
+// ===========================================================================
+describe('FIX: addMembership failure', () => {
+	it('emits error instead of throwing when the interface is unavailable', async () => {
+		addMembershipError = new Error('ENODEV: no such device')
+		const errors: Error[] = []
+		const client = new PTPv2Client('0.0.0.0')
+		client.on('error', (err) => errors.push(err))
+		await new Promise<void>((r) => setImmediate(r))
+		await new Promise<void>((r) => setImmediate(r))
+
+		expect(errors.length).toBeGreaterThan(0)
+		expect(errors[0].message).toContain('ENODEV')
+		client.destroy()
+	})
+})
+
+// ===========================================================================
+// FIX: domain discovery only from PTPv2 traffic
+// ===========================================================================
+describe('FIX: domain discovery', () => {
+	it('ignores domains from packets that are not PTPv2', async () => {
+		const client = await makeClient()
+		eventSocket().emit('message', makeSyncBuffer({ version: 1, domain: 5 }), rinfo)
+		expect([...client.domains]).not.toContain(5)
+		client.destroy()
+	})
+
+	it('ignores reserved domains above 127', async () => {
+		const client = await makeClient()
+		eventSocket().emit('message', makeSyncBuffer({ domain: 200 }), rinfo)
+		expect([...client.domains]).not.toContain(200)
+		client.destroy()
+	})
+
+	it('still records other valid domains it observes', async () => {
+		const client = await makeClient()
+		eventSocket().emit('message', makeSyncBuffer({ domain: 7 }), rinfo)
+		expect([...client.domains]).toContain(7)
 		client.destroy()
 	})
 })

@@ -1,6 +1,8 @@
 import dgram from 'dgram'
 import { EventEmitter } from 'events'
 import { isIPv4 } from 'net'
+import { networkInterfaces } from 'os'
+import { randomBytes } from 'crypto'
 
 export type PtpTime = [number, number]
 
@@ -12,28 +14,89 @@ export type PtpTime = [number, number]
 const PTP_PRIMARY_MULTICAST = '224.0.1.129'
 const ptpDedicatedMulticastAddrs = ['224.0.1.129', '224.0.1.130', '224.0.1.131', '224.0.1.132']
 
+const PTP_EVENT_PORT = 319
+const PTP_GENERAL_PORT = 320
+
+// Message types (low nibble of byte 0)
+const MSG_SYNC = 0x00
+const MSG_DELAY_REQ = 0x01
+const MSG_FOLLOW_UP = 0x08
+const MSG_DELAY_RESP = 0x09
+
+// Offsets into the PTP packet
+const SOURCE_PORT_IDENTITY_OFFSET = 20 // 8-byte clockIdentity + 2-byte portNumber
+const PORT_IDENTITY_LENGTH = 10
+const SEQUENCE_OFFSET = 30
+const CONTROL_FIELD_OFFSET = 32
+const LOG_MSG_INTERVAL_OFFSET = 33
+const TIMESTAMP_OFFSET = 34 // 6-byte seconds + 4-byte nanoseconds
+const TIMESTAMP_LENGTH = 10
+// Delay_Resp carries the requesting slave's portIdentity after the timestamp
+const REQUESTING_PORT_IDENTITY_OFFSET = TIMESTAMP_OFFSET + TIMESTAMP_LENGTH
+const DELAY_RESP_LENGTH = REQUESTING_PORT_IDENTITY_OFFSET + PORT_IDENTITY_LENGTH
+// A Delay_Req is header + originTimestamp; the timestamp itself is sent as zero
+const DELAY_REQ_LENGTH = TIMESTAMP_OFFSET + TIMESTAMP_LENGTH
+
+const NS_PER_S = 1_000_000_000n
+
 const ptpMulticastAddr = (domain: number): string =>
 	domain <= 3 ? ptpDedicatedMulticastAddrs[domain] : PTP_PRIMARY_MULTICAST
 
 //functions
 
-const normalizePtpTime = (s: number, ns: number): PtpTime => {
-	if (ns >= 1_000_000_000) {
-		s += Math.floor(ns / 1_000_000_000)
-		ns = ns % 1_000_000_000
-	} else if (ns < 0) {
-		const borrow = Math.ceil(-ns / 1_000_000_000)
-		s -= borrow
-		ns += borrow * 1_000_000_000
+/**
+ * Convert a nanosecond count to the public `[seconds, nanoseconds]` shape.
+ * Uses floored division so that nanoseconds stay in [0, 1e9) for negative inputs too.
+ */
+const toPtpTime = (nanoseconds: bigint): PtpTime => {
+	let s = nanoseconds / NS_PER_S
+	let ns = nanoseconds % NS_PER_S
+	if (ns < 0n) {
+		s -= 1n
+		ns += NS_PER_S
 	}
-	return [s, ns]
+	return [Number(s), Number(ns)]
 }
 
-const getCorrectedTime = (offset: PtpTime): PtpTime => {
-	const time = process.hrtime()
-	const timeS = time[0] - offset[0]
-	const timeNS = time[1] - offset[1]
-	return normalizePtpTime(timeS, timeNS)
+/**
+ * Read a PTP 80-bit timestamp (48-bit seconds + 32-bit nanoseconds) as nanoseconds.
+ * The seconds field is wider than a double can hold exactly once scaled to nanoseconds,
+ * which is why the whole pipeline works in BigInt.
+ */
+const readPtpTimestamp = (buffer: Buffer, at: number = TIMESTAMP_OFFSET): bigint => {
+	const seconds = (BigInt(buffer.readUInt16BE(at)) << 32n) | BigInt(buffer.readUInt32BE(at + 2))
+	return seconds * NS_PER_S + BigInt(buffer.readUInt32BE(at + 6))
+}
+
+/**
+ * Derive an IEEE 1588 clockIdentity from an interface MAC, per §7.5.2.2.2:
+ * the EUI-48 is expanded to an EUI-64 by inserting FF FE in the middle.
+ */
+const clockIdentityFromMac = (mac: string): Buffer | undefined => {
+	const bytes = mac.split(':').map((part) => parseInt(part, 16))
+	if (bytes.length !== 6 || bytes.some((byte) => Number.isNaN(byte))) return undefined
+	// Some virtual interfaces report an all-zero MAC, which is not a usable identity
+	if (bytes.every((byte) => byte === 0)) return undefined
+	return Buffer.from([bytes[0], bytes[1], bytes[2], 0xff, 0xfe, bytes[3], bytes[4], bytes[5]])
+}
+
+/**
+ * The clockIdentity for the interface we are bound to. Falls back to a random identity so
+ * that two clients are never mistaken for each other, which is what matters for matching
+ * Delay_Resp messages.
+ */
+const clockIdentityForAddress = (addr: string): Buffer => {
+	for (const nics of Object.values(networkInterfaces())) {
+		for (const nic of nics ?? []) {
+			if (nic.family !== 'IPv4') continue
+			// '0.0.0.0' means "any interface", so take the first usable non-internal MAC
+			if (addr !== '0.0.0.0' && nic.address !== addr) continue
+			if (addr === '0.0.0.0' && nic.internal) continue
+			const identity = clockIdentityFromMac(nic.mac)
+			if (identity) return identity
+		}
+	}
+	return randomBytes(8)
 }
 
 export interface PTPv2ClientEvents {
@@ -64,20 +127,26 @@ export class PTPv2Client extends EventEmitter<PTPv2ClientEvents> {
 	private ptpMasterAddress: string = ''
 	private minSyncInterval: number = 10000
 	private domainsFound: Set<number> = new Set<number>()
+	private destroyed: boolean = false
+
+	// Our portIdentity: 8-byte clockIdentity + 2-byte portNumber. Sent in every Delay_Req and
+	// compared against the requestingPortIdentity echoed back in Delay_Resp.
+	private readonly portIdentity: Buffer
 
 	//PTPv2
 	private ptpClientEvent = dgram.createSocket({ type: 'udp4', reuseAddr: true })
 	private ptpClientGeneral = dgram.createSocket({ type: 'udp4', reuseAddr: true })
 
-	//vars
-	private t1: PtpTime = [0, 0]
-	private ts1: PtpTime = [0, 0]
-	private t2: PtpTime = [0, 0]
-	private ts2: PtpTime = [0, 0]
-	private offset: PtpTime = [0, 0]
+	//vars — all times are nanoseconds. t1/ts2 come from the master, ts1/t2 are local.
+	private t1: bigint = 0n // Sync transmit time at the master
+	private ts1: bigint = 0n // Sync receive time here
+	private t2: bigint = 0n // Delay_Req transmit time here
+	private ts2: bigint = 0n // Delay_Req receive time at the master
+	private offset: bigint = 0n // local clock − ptp time
 	private sync_seq: number = 0
 	private req_seq: number = 0
 	private lastSync: number = 0
+	private lastRequest: number = 0
 
 	/**
 	 * Initialise the client
@@ -99,12 +168,16 @@ export class PTPv2Client extends EventEmitter<PTPv2ClientEvents> {
 		if (domain >= 0 && domain <= 127) this.ptp_domain = Math.round(domain)
 		if (interval >= 125) this.minSyncInterval = Math.round(interval)
 
+		this.portIdentity = Buffer.alloc(PORT_IDENTITY_LENGTH)
+		clockIdentityForAddress(this.addr).copy(this.portIdentity, 0)
+		this.portIdentity.writeUInt16BE(1, 8) // portNumber; a single-port client is always 1
+
 		this.ptpClientEvent.on('listening', () => {
-			this.ptpClientEvent.addMembership(ptpMulticastAddr(this.ptp_domain), this.addr)
+			this.joinMulticast(this.ptpClientEvent)
 			this.emit('listening', `ptpClientEvent socket listening`)
 		})
 		this.ptpClientGeneral.on('listening', () => {
-			this.ptpClientGeneral.addMembership(ptpMulticastAddr(this.ptp_domain), this.addr)
+			this.joinMulticast(this.ptpClientGeneral)
 			this.emit('listening', `ptpClientGeneral socket listening`)
 		})
 		this.ptpClientEvent.on('error', (err) => {
@@ -122,10 +195,10 @@ export class PTPv2Client extends EventEmitter<PTPv2ClientEvents> {
 		})
 
 		this.ptpClientEvent.on('message', (buffer, rinfo): void => {
-			const recv_ts = getCorrectedTime(this.offset) //safe timestamp for ts1
+			const recv_ts = this.correctedTime() //safe timestamp for ts1
 
 			//check buffer length
-			if (buffer.length < 32) return
+			if (buffer.length < SEQUENCE_OFFSET + 2) return
 
 			//read values from buffer
 			const type = buffer.readUInt8(0) & 0x0f
@@ -134,18 +207,18 @@ export class PTPv2Client extends EventEmitter<PTPv2ClientEvents> {
 			const domain = buffer.readUInt8(4)
 			const flags = buffer.readUInt16BE(6)
 			let source = buffer.toString('hex', 20, 28)
-			if (source == null) return
 			const sourceB = source.match(/.{1,2}/g)
 			if (sourceB == null) return
 			source = sourceB.join('-') + ':0'
-			//const sourceAlt = buffer.toString('hex', 20, 28).match(/.{1,2}/g).join(':')
-			const sequence = buffer.readUInt16BE(30)
-			this.addDomain(domain)
-			if (version != 2 || domain != this.ptp_domain)
-				//check for version 2 and domain 0
-				return
+			const sequence = buffer.readUInt16BE(SEQUENCE_OFFSET)
 
-			if (type != 0)
+			// Only record domains from packets that are actually PTPv2, so unrelated traffic
+			// on ports 319/320 can't pollute the discovered-domain list
+			if (version != 2) return
+			this.addDomain(domain)
+			if (domain != this.ptp_domain) return
+
+			if (type != MSG_SYNC)
 				//only process sync messages
 				return
 
@@ -153,7 +226,8 @@ export class PTPv2Client extends EventEmitter<PTPv2ClientEvents> {
 			if (source != this.ptpMaster) {
 				this.ptpMaster = source
 				this.ptpMasterAddress = rinfo.address
-				this.sync = false
+				// Route through sync_change so listeners see the transition
+				this.sync_change(false)
 				this.emit('ptp_master_changed', this.ptpMaster, rinfo.address, this.sync)
 			}
 
@@ -164,85 +238,44 @@ export class PTPv2Client extends EventEmitter<PTPv2ClientEvents> {
 			if ((flags & 0x0200) == 0x0200) {
 				//two step, wait for follow_up msg for accurate t1
 				this.ts1 = recv_ts
-			} else if (Date.now() - this.lastSync > this.minSyncInterval) {
-				if (buffer.length < 44) return
+			} else if (this.dueForExchange()) {
+				if (buffer.length < TIMESTAMP_OFFSET + TIMESTAMP_LENGTH) return
 				//got accurate t1 (no follow_up msg)
 				this.ts1 = recv_ts
+				this.t1 = readPtpTimestamp(buffer)
 
-				// FIX: use * 2^32 instead of << 4 to correctly combine the 48-bit seconds field
-				const tsS = buffer.readUInt16BE(34) * 4294967296 + buffer.readUInt32BE(36)
-				const tsNS = buffer.readUInt32BE(40)
-				this.t1 = [tsS, tsNS]
-
-				//send delay_req
-				setImmediate(() => {
-					this.ptpClientEvent.send(this.ptp_delay_req(), 319, ptpMulticastAddr(this.ptp_domain), (err, _bytes) => {
-						if (err) {
-							console.log(err)
-							this.emit('error', err)
-						} else {
-							// FIX: only capture t2 after the packet has actually been sent
-							this.t2 = getCorrectedTime(this.offset)
-						}
-					})
-				})
-				// FIX: removed redundant pre-send t2 assignment that was always overwritten
+				this.sendDelayReq()
 			}
 		})
 
 		this.ptpClientGeneral.on('message', (buffer, _rinfo): void => {
 			//check buffer length
-			if (buffer.length < 32) return
+			if (buffer.length < SEQUENCE_OFFSET + 2) return
 
 			//read values from buffer
 			const type = buffer.readUInt8(0) & 0x0f
 			const version = buffer.readUInt8(1)
 			//const length = buffer.readUInt16BE(2)
 			const domain = buffer.readUInt8(4)
-			//const flags = buffer.readUInt16BE(6)
-			//const source = buffer.toString('hex', 20, 28).match(/.{1,2}/g).join('-') + ':0'
-			const sequence = buffer.readUInt16BE(30)
+			const sequence = buffer.readUInt16BE(SEQUENCE_OFFSET)
+
+			if (version != 2) return
 			this.addDomain(domain)
-			//check for version 2 and domain
-			if (version != 2 || domain != this.ptp_domain || buffer.length < 44) return
-			if (type == 0x08 && this.sync_seq == sequence && Date.now() - this.lastSync > this.minSyncInterval) {
+			if (domain != this.ptp_domain || buffer.length < TIMESTAMP_OFFSET + TIMESTAMP_LENGTH) return
+
+			if (type == MSG_FOLLOW_UP && this.sync_seq == sequence && this.dueForExchange()) {
 				//follow up msg with current seq
-				// FIX: use * 2^32 instead of << 4 to correctly combine the 48-bit seconds field
-				const tsS = buffer.readUInt16BE(34) * 4294967296 + buffer.readUInt32BE(36)
-				const tsNS = buffer.readUInt32BE(40)
-				this.t1 = [tsS, tsNS]
+				this.t1 = readPtpTimestamp(buffer)
 
-				//send delay_req
-				setImmediate(() => {
-					this.ptpClientEvent.send(this.ptp_delay_req(), 319, ptpMulticastAddr(this.ptp_domain), (err, _bytes) => {
-						if (err) {
-							console.log(err)
-							this.emit('error', err)
-						} else {
-							// FIX: only capture t2 after the packet has actually been sent
-							this.t2 = getCorrectedTime(this.offset)
-						}
-					})
-				})
-				// FIX: removed redundant pre-send t2 assignment that was always overwritten
-			} else if (type == 0x09 && this.req_seq == sequence) {
+				this.sendDelayReq()
+			} else if (type == MSG_DELAY_RESP && this.req_seq == sequence && this.isOurDelayResp(buffer)) {
 				//delay_rsp msg
-				// FIX: use * 2^32 instead of << 4 to correctly combine the 48-bit seconds field
-				const tsS = buffer.readUInt16BE(34) * 4294967296 + buffer.readUInt32BE(36)
-				const tsNS = buffer.readUInt32BE(40)
-				this.ts2 = [tsS, tsNS]
+				this.ts2 = readPtpTimestamp(buffer)
 
-				//calc offset
-				const delta =
-					0.5 * (this.ts1[0] - this.t1[0] - this.ts2[0] + this.t2[0]) * 1000000000 +
-					0.5 * (this.ts1[1] - this.t1[1] - this.ts2[1] + this.t2[1])
-
-				// FIX: use Math.trunc (not %) to correctly split negative deltas,
-				// then normalise the accumulated offset to keep ns within [0, 1e9)
-				const deltaS = Math.trunc(delta / 1_000_000_000)
-				const deltaNS = delta - deltaS * 1_000_000_000
-
-				this.offset = normalizePtpTime(this.offset[0] + deltaS, this.offset[1] + deltaNS)
+				// offset = ((t2 − t1) − (t4 − t3)) / 2, in this class's naming
+				// ((ts1 − t1) − (ts2 − t2)) / 2. ts1 and t2 are already offset-corrected, so
+				// this is the residual error and accumulates onto the running offset.
+				this.offset += (this.ts1 - this.t1 - (this.ts2 - this.t2)) / 2n
 
 				this.lastSync = Date.now()
 				this.emit('ptp_time_synced', this.ptp_time, this.lastSync)
@@ -251,17 +284,70 @@ export class PTPv2Client extends EventEmitter<PTPv2ClientEvents> {
 				this.sync_change(true)
 			}
 		})
+
+		// Must bind to INADDR_ANY: a socket bound to a specific unicast address will not
+		// receive datagrams addressed to the multicast group. The interface is selected by
+		// addMembership() below, not by the bind address.
+		// Bind errors (EADDRINUSE, EACCES on these privileged ports) arrive on the 'error'
+		// event, never as a throw, so there is nothing useful to catch here.
+		this.ptpClientEvent.bind(PTP_EVENT_PORT)
+		this.ptpClientGeneral.bind(PTP_GENERAL_PORT)
+	}
+
+	/**
+	 * Join the PTP multicast group on the configured interface.
+	 * addMembership throws synchronously if the interface has gone away, which would
+	 * otherwise escape from the 'listening' handler and take the process down.
+	 */
+	private joinMulticast(socket: dgram.Socket): void {
 		try {
-			this.ptpClientEvent.bind(319, this.addr)
-			this.ptpClientGeneral.bind(320, this.addr)
+			socket.addMembership(ptpMulticastAddr(this.ptp_domain), this.addr)
 		} catch (e) {
-			console.log(e)
-			const err: Error = {
-				message: `Could not bind to ports 319, 320.`,
-				name: 'Already in use',
-			}
-			this.emit('error', err)
+			this.emit('error', e instanceof Error ? e : new Error(String(e)))
 		}
+	}
+
+	/** Local time in the PTP timebase, in nanoseconds. */
+	private correctedTime(): bigint {
+		return process.hrtime.bigint() - this.offset
+	}
+
+	/**
+	 * Whether enough time has passed to start another delay request exchange.
+	 * Keyed on the last *attempt* rather than the last success — keying it on success meant
+	 * that while a master was not answering, every incoming Sync fired another Delay_Req.
+	 */
+	private dueForExchange(): boolean {
+		return Date.now() - this.lastRequest > this.minSyncInterval
+	}
+
+	/** Is this Delay_Resp answering our request, rather than another slave's? */
+	private isOurDelayResp(buffer: Buffer): boolean {
+		if (buffer.length < DELAY_RESP_LENGTH) return false
+		return (
+			buffer.compare(this.portIdentity, 0, PORT_IDENTITY_LENGTH, REQUESTING_PORT_IDENTITY_OFFSET, DELAY_RESP_LENGTH) ===
+			0
+		)
+	}
+
+	private sendDelayReq(): void {
+		this.lastRequest = Date.now()
+		setImmediate(() => {
+			if (this.destroyed) return
+			this.ptpClientEvent.send(
+				this.ptp_delay_req(),
+				PTP_EVENT_PORT,
+				ptpMulticastAddr(this.ptp_domain),
+				(err, _bytes) => {
+					if (err) {
+						this.emit('error', err)
+					} else {
+						// only capture t2 after the packet has actually been sent
+						this.t2 = this.correctedTime()
+					}
+				},
+			)
+		})
 	}
 
 	/**
@@ -270,13 +356,15 @@ export class PTPv2Client extends EventEmitter<PTPv2ClientEvents> {
 	 */
 
 	public destroy(): void {
+		if (this.destroyed) return
+		this.destroyed = true
 		if (this.syncTimeout) clearTimeout(this.syncTimeout)
+		this.syncTimeout = undefined
 		this.ptpClientEvent.removeAllListeners()
 		this.ptpClientEvent.close()
 		this.ptpClientGeneral.removeAllListeners()
 		this.ptpClientGeneral.close()
-		this.sync = false
-		this.emit('sync_changed', this.sync)
+		this.sync_change(false)
 	}
 
 	/**
@@ -285,16 +373,20 @@ export class PTPv2Client extends EventEmitter<PTPv2ClientEvents> {
 	 */
 
 	private ptp_delay_req(): Buffer<ArrayBuffer> {
-		const length = 52
-		const buffer = Buffer.alloc(length)
+		const buffer = Buffer.alloc(DELAY_REQ_LENGTH)
 		this.req_seq = (this.req_seq + 1) % 0x10000
 
-		buffer.writeUInt8(1, 0)
+		buffer.writeUInt8(MSG_DELAY_REQ, 0)
 		buffer.writeUInt8(2, 1)
-		buffer.writeUInt16BE(length, 2)
-		// FIX: set the domain byte so masters on non-zero domains respond correctly
+		buffer.writeUInt16BE(DELAY_REQ_LENGTH, 2)
+		// set the domain byte so masters on non-zero domains respond correctly
 		buffer.writeUInt8(this.ptp_domain, 4)
-		buffer.writeUInt16BE(this.req_seq, 30)
+		// Without a sourcePortIdentity the master echoes back all zeroes, leaving every client
+		// on the network indistinguishable in the Delay_Resp
+		this.portIdentity.copy(buffer, SOURCE_PORT_IDENTITY_OFFSET)
+		buffer.writeUInt16BE(this.req_seq, SEQUENCE_OFFSET)
+		buffer.writeUInt8(0x01, CONTROL_FIELD_OFFSET) // controlField: Delay_Req
+		buffer.writeUInt8(0x7f, LOG_MSG_INTERVAL_OFFSET) // logMessageInterval: not periodic
 
 		return buffer
 	}
@@ -312,6 +404,7 @@ export class PTPv2Client extends EventEmitter<PTPv2ClientEvents> {
 	 */
 
 	private addDomain(domain: number): void {
+		if (domain > 127) return // 128–255 are reserved by the standard
 		if (this.domainsFound.has(domain)) return
 		this.domainsFound.add(domain)
 		this.emit(`domains`, this.domainsFound.values())
@@ -335,6 +428,15 @@ export class PTPv2Client extends EventEmitter<PTPv2ClientEvents> {
 
 	public get is_synced(): boolean {
 		return this.sync
+	}
+
+	/**
+	 * This client's PTP clockIdentity, as hex
+	 *
+	 */
+
+	public get clock_identity(): string {
+		return this.portIdentity.toString('hex', 0, 8)
 	}
 
 	/**
@@ -364,9 +466,17 @@ export class PTPv2Client extends EventEmitter<PTPv2ClientEvents> {
 	 */
 
 	public get ptp_time(): PtpTime {
-		const time = process.hrtime()
-		// FIX: normalise to handle nanosecond underflow
-		return normalizePtpTime(time[0] - this.offset[0], time[1] - this.offset[1])
+		return toPtpTime(this.correctedTime())
+	}
+
+	/**
+	 * PTP Time
+	 * @returns bigint
+	 *
+	 */
+
+	public get ptp_time_n(): bigint {
+		return this.correctedTime()
 	}
 
 	/**

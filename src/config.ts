@@ -1,7 +1,7 @@
 import type { SomeCompanionConfigField, DropdownChoice } from '@companion-module/base'
 import os from 'os'
 
-export interface ModuleConfig {
+export type ModuleConfig = {
 	interface: string
 	domain: number
 	interval: number
@@ -26,7 +26,7 @@ export function GetConfigFields(): SomeCompanionConfigField[] {
 			label: 'Interface',
 			width: 8,
 			choices: localNics,
-			default: localNics[0].id ?? 'No available NICs',
+			default: localNics[0]?.id ?? 'No available NICs',
 		},
 		{
 			type: 'number',

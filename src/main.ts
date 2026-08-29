@@ -1,15 +1,27 @@
-import { InstanceBase, runEntrypoint, InstanceStatus, SomeCompanionConfigField } from '@companion-module/base'
+import { InstanceBase, InstanceStatus, type SomeCompanionConfigField } from '@companion-module/base'
 import { GetConfigFields, type ModuleConfig } from './config.js'
-import { UpdateVariableDefinitions } from './variables.js'
+import { UpdateVariableDefinitions, type VariablesSchema } from './variables.js'
 import { UpgradeScripts } from './upgrades.js'
-import { UpdateActions } from './actions.js'
-import { UpdateFeedbacks } from './feedbacks.js'
+import { UpdateActions, type ActionsSchema } from './actions.js'
+import { UpdateFeedbacks, FeedbackIDs, type FeedbacksSchema } from './feedbacks.js'
 import { PTPv2Client } from './ptpv2.js'
 import { StatusManager } from './status.js'
-export class ModuleInstance extends InstanceBase<ModuleConfig> {
+
+export type ModuleSchema = {
+	config: ModuleConfig
+	secrets: undefined
+	actions: ActionsSchema
+	feedbacks: FeedbacksSchema
+	variables: VariablesSchema
+}
+
+export { UpgradeScripts }
+
+export default class ModuleInstance extends InstanceBase<ModuleSchema> {
 	config!: ModuleConfig // Setup in init()
-	client!: PTPv2Client
+	client: PTPv2Client | undefined
 	statusManager = new StatusManager(this)
+
 	constructor(internal: unknown) {
 		super(internal)
 	}
@@ -19,19 +31,22 @@ export class ModuleInstance extends InstanceBase<ModuleConfig> {
 		this.updateFeedbacks() // export feedbacks
 		this.updateVariableDefinitions() // export variable definitions
 		this.statusManager.updateStatus(InstanceStatus.Connecting)
-		this.configUpdated(config).catch(() => {})
+		void this.configUpdated(config)
 	}
 	// When module gets deleted
 	async destroy(): Promise<void> {
-		this.log('debug', `destroy ${this.id}`)
-		this.client.destroy()
+		this.log('debug', `destroy ${this.id}:${this.label}`)
+		this.client?.destroy()
+		this.client = undefined
+		this.statusManager.destroy()
 	}
 
 	async configUpdated(config: ModuleConfig): Promise<void> {
 		this.config = config
 		process.title = this.label
 
-		if (this.client) this.client.destroy()
+		this.client?.destroy()
+		this.client = undefined
 
 		if (config.interface) {
 			try {
@@ -49,10 +64,11 @@ export class ModuleInstance extends InstanceBase<ModuleConfig> {
 	}
 
 	private listenForClientEvents(): void {
+		if (!this.client) return
 		this.client.on('ptp_master_changed', (ptp_master, master_address, sync) => {
 			this.log('info', `PTPv2 Master Changed: ${ptp_master} Address: ${master_address}`)
 			this.log(sync ? 'info' : 'warn', `PTP Sync Changed. ${sync ? 'Locked' : 'Unlocked'}`)
-			this.checkFeedbacks()
+			this.checkFeedbacks(FeedbackIDs.IsSynced)
 			this.setVariableValues({ ptpMaster: ptp_master, ptpMasterAddress: master_address })
 		})
 		this.client.on('ptp_time_synced', (time, lastSync) => {
@@ -63,7 +79,7 @@ export class ModuleInstance extends InstanceBase<ModuleConfig> {
 		})
 		this.client.on('sync_changed', (sync) => {
 			this.log(sync ? 'info' : 'warn', `PTP Sync Changed. ${sync ? 'Locked' : 'Unlocked'}`)
-			this.checkFeedbacks()
+			this.checkFeedbacks(FeedbackIDs.IsSynced)
 		})
 		this.client.on('error', (err) => {
 			this.statusManager.updateStatus(InstanceStatus.UnknownError)
@@ -80,7 +96,8 @@ export class ModuleInstance extends InstanceBase<ModuleConfig> {
 		})
 	}
 
-	private getVarValues() {
+	private getVarValues(): void {
+		if (!this.client) return
 		const time = this.client.ptp_time
 		const ptp_master = this.client.ptp_master
 		const syncTime = new Date(this.client.last_sync)
@@ -91,7 +108,7 @@ export class ModuleInstance extends InstanceBase<ModuleConfig> {
 			ptpMaster: ptp_master[0],
 			ptpMasterAddress: ptp_master[1],
 		})
-		this.checkFeedbacks()
+		this.checkFeedbacks(FeedbackIDs.IsSynced)
 	}
 
 	// Return config fields for web config
@@ -111,5 +128,3 @@ export class ModuleInstance extends InstanceBase<ModuleConfig> {
 		UpdateVariableDefinitions(this)
 	}
 }
-
-runEntrypoint(ModuleInstance, UpgradeScripts)

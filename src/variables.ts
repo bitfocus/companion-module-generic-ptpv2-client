@@ -1,11 +1,19 @@
-import type { ModuleInstance } from './main.js'
+import type ModuleInstance from './main.js'
+
+export type VariablesSchema = {
+	ptpTimeS: number | undefined
+	ptpTimeNS: number | undefined
+	ptpMaster: string
+	ptpMasterAddress: string
+	lastSync: string
+}
 
 export function UpdateVariableDefinitions(self: ModuleInstance): void {
-	self.setVariableDefinitions([
-		{ variableId: 'ptpTimeS', name: 'PTP Time (s)' },
-		{ variableId: 'ptpTimeNS', name: 'PTP Time (ns)' },
-		{ variableId: 'ptpMaster', name: 'PTP Master (Clock Identity)' },
-		{ variableId: 'ptpMasterAddress', name: 'PTP Master (Address)' },
-		{ variableId: 'lastSync', name: 'Last Sync Timestamp' },
-	])
+	self.setVariableDefinitions({
+		ptpTimeS: { name: 'PTP Time (s)' },
+		ptpTimeNS: { name: 'PTP Time (ns)' },
+		ptpMaster: { name: 'PTP Master (Clock Identity)' },
+		ptpMasterAddress: { name: 'PTP Master (Address)' },
+		lastSync: { name: 'Last Sync Timestamp' },
+	})
 }

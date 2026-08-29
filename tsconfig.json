@@ -1,6 +1,6 @@
 {
 	"extends": "./tsconfig.build.json",
-	"include": ["src/**/*.ts", "vitest.config.ts"],
+	"include": ["src/**/*.ts"],
 	"exclude": ["node_modules/**"],
 	"compilerOptions": {
 		"types": ["node" /* , "jest" ] // uncomment this if using jest */]

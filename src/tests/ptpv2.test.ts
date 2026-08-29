@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
-//import type { PtpTime } from './ptpv2.ts'
+//import type { PtpTime } from '../ptpv2.js'
 
 // ---------------------------------------------------------------------------
 // dgram mock
@@ -56,7 +56,7 @@ vi.mock('dgram', () => ({
 // ---------------------------------------------------------------------------
 // Import AFTER mock is set up so the module picks up the fake dgram
 // ---------------------------------------------------------------------------
-const { PTPv2Client } = await import('./ptpv2.js')
+const { PTPv2Client } = await import('../ptpv2.js')
 
 // ---------------------------------------------------------------------------
 // Buffer builders

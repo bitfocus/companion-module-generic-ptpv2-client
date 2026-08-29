@@ -24,9 +24,18 @@ class MockSocket {
 		if (addMembershipError) throw addMembershipError
 	})
 	send = vi.fn((_buf: Buffer, _port: number, _addr: string, cb?: (err: Error | null) => void) => {
+		// Real dgram throws synchronously on a closed socket rather than reporting via cb
+		if (this.closed) {
+			const err = new Error('Not running') as NodeJS.ErrnoException
+			err.code = 'ERR_SOCKET_DGRAM_NOT_RUNNING'
+			throw err
+		}
 		cb?.(null)
 	})
-	close = vi.fn()
+	closed = false
+	close = vi.fn(() => {
+		this.closed = true
+	})
 	removeAllListeners = vi.fn(() => {
 		this._handlers.clear()
 	})
@@ -1138,5 +1147,980 @@ describe('FIX: domain discovery', () => {
 		eventSocket().emit('message', makeSyncBuffer({ domain: 7 }), rinfo)
 		expect([...client.domains]).toContain(7)
 		client.destroy()
+	})
+})
+
+// ===========================================================================
+// FIX: destroy() while a Delay_Req is still queued
+// ===========================================================================
+describe('FIX: destroy with a pending Delay_Req', () => {
+	it('does not send on a closed socket when destroyed before the send fires', async () => {
+		const client = await makeClient('0.0.0.0', 0, 125)
+
+		// sendDelayReq defers the send with setImmediate, so a destroy() in between would
+		// otherwise reach a closed socket and throw ERR_SOCKET_DGRAM_NOT_RUNNING
+		// synchronously — an uncaught exception, not an 'error' event.
+		eventSocket().emit('message', makeSyncBuffer({ flags: 0x0000, tsSecondsLow: 1_700_000_000 }), rinfo)
+		const socket = eventSocket()
+		client.destroy()
+
+		await new Promise<void>((r) => setImmediate(r))
+		await new Promise<void>((r) => setImmediate(r))
+
+		expect(socket.send).not.toHaveBeenCalled()
+	})
+})
+
+// ===========================================================================
+// correctionField
+// ===========================================================================
+/** Write a correctionField (nanoseconds) into a packet: signed 64-bit, scaled by 2^16 */
+const withCorrection = (buf: Buffer, nanoseconds: number): Buffer => {
+	buf.writeBigInt64BE(BigInt(nanoseconds) * 65536n, 8)
+	return buf
+}
+
+describe('correctionField', () => {
+	/**
+	 * Residence time accumulated by transparent clocks lives in correctionField, not in the
+	 * timestamps. Two runs with identical timestamps but different corrections must produce
+	 * different offsets, otherwise the field is being ignored.
+	 */
+	const offsetFor = async (syncCorrection: number, respCorrection: number): Promise<bigint> => {
+		mockSockets = []
+		const client = await makeClient('0.0.0.0', 0, 125)
+		eventSocket().emit(
+			'message',
+			withCorrection(makeSyncBuffer({ flags: 0x0000, tsSecondsLow: 1_700_000_000 }), syncCorrection),
+			rinfo,
+		)
+		await new Promise<void>((r) => setImmediate(r))
+		generalSocket().emit(
+			'message',
+			withCorrection(makeDelayRespBuffer(client, { sequence: 1, tsSecondsLow: 1_700_000_000 }), respCorrection),
+			rinfo,
+		)
+		const time = client.ptp_time_n
+		client.destroy()
+		return time
+	}
+
+	// A correction on one direction of the exchange moves the offset by *half* its value,
+	// since offset = ((t2 - t1) - (t4 - t3)) / 2. 5ms is used so the signal (2.5ms) is far
+	// larger than the few microseconds of hrtime jitter between two separate runs.
+	const CORRECTION = 5_000_000
+	const HALF = BigInt(CORRECTION / 2)
+	const TOLERANCE = 500_000n
+
+	it('a Sync correction advances t1 and so advances ptp_time by half of it', async () => {
+		const none = await offsetFor(0, 0)
+		const corrected = await offsetFor(CORRECTION, 0)
+		const shift = corrected - none
+		expect(shift).toBeGreaterThan(HALF - TOLERANCE)
+		expect(shift).toBeLessThan(HALF + TOLERANCE)
+	})
+
+	it('a Delay_Resp correction retards t4 and so retards ptp_time by half of it', async () => {
+		const none = await offsetFor(0, 0)
+		const corrected = await offsetFor(0, CORRECTION)
+		const shift = none - corrected
+		expect(shift).toBeGreaterThan(HALF - TOLERANCE)
+		expect(shift).toBeLessThan(HALF + TOLERANCE)
+	})
+
+	it('corrections on both directions cancel in the offset but not in the path delay', async () => {
+		mockSockets = []
+		const client = await makeClient('0.0.0.0', 0, 125)
+		eventSocket().emit(
+			'message',
+			withCorrection(makeSyncBuffer({ flags: 0x0000, tsSecondsLow: 1_700_000_000 }), CORRECTION),
+			rinfo,
+		)
+		await new Promise<void>((r) => setImmediate(r))
+		generalSocket().emit(
+			'message',
+			withCorrection(makeDelayRespBuffer(client, { sequence: 1, tsSecondsLow: 1_700_000_000 }), CORRECTION),
+			rinfo,
+		)
+		// Residence time is real transit time, so it comes out of the measured path delay.
+		// The upper bound matters: getting the sign of one term wrong also produces a very
+		// negative number, but one about 12 orders of magnitude too large.
+		expect(client.mean_path_delay).toBeLessThan(-BigInt(CORRECTION) + TOLERANCE)
+		expect(client.mean_path_delay).toBeGreaterThan(-BigInt(CORRECTION) - TOLERANCE)
+		client.destroy()
+	})
+
+	/** Two-step equivalent: the Sync and its Follow_Up each carry their own correction */
+	const twoStepOffsetFor = async (syncCorrection: number, followUpCorrection: number): Promise<bigint> => {
+		mockSockets = []
+		const client = await makeClient('0.0.0.0', 0, 125)
+		eventSocket().emit('message', withCorrection(makeSyncBuffer({ flags: 0x0200, sequence: 1 }), syncCorrection), rinfo)
+		generalSocket().emit(
+			'message',
+			withCorrection(makeFollowUpBuffer({ sequence: 1, tsSecondsLow: 1_700_000_000 }), followUpCorrection),
+			rinfo,
+		)
+		await new Promise<void>((r) => setImmediate(r))
+		generalSocket().emit('message', makeDelayRespBuffer(client, { sequence: 1, tsSecondsLow: 1_700_000_000 }), rinfo)
+		const time = client.ptp_time_n
+		client.destroy()
+		return time
+	}
+
+	it('applies the Follow_Up correction in two-step', async () => {
+		const none = await twoStepOffsetFor(0, 0)
+		const corrected = await twoStepOffsetFor(0, CORRECTION)
+		const shift = corrected - none
+		expect(shift).toBeGreaterThan(HALF - TOLERANCE)
+		expect(shift).toBeLessThan(HALF + TOLERANCE)
+	})
+
+	it('sums the Sync and Follow_Up corrections, since both are on the master to slave path', async () => {
+		const none = await twoStepOffsetFor(0, 0)
+		const both = await twoStepOffsetFor(CORRECTION, CORRECTION)
+		const shift = both - none
+		// two corrections of CORRECTION each, halved -> a full CORRECTION of shift
+		expect(shift).toBeGreaterThan(BigInt(CORRECTION) - TOLERANCE)
+		expect(shift).toBeLessThan(BigInt(CORRECTION) + TOLERANCE)
+	})
+})
+
+// ===========================================================================
+// mean path delay
+// ===========================================================================
+describe('mean path delay', () => {
+	it('is computed from the same exchange as the offset', async () => {
+		const client = await makeClient('0.0.0.0', 0, 125)
+		expect(client.mean_path_delay).toBe(0n)
+
+		eventSocket().emit('message', makeSyncBuffer({ flags: 0x0000, tsSecondsLow: 1_700_000_000 }), rinfo)
+		await new Promise<void>((r) => setImmediate(r))
+		generalSocket().emit('message', makeDelayRespBuffer(client, { sequence: 1, tsSecondsLow: 1_700_000_000 }), rinfo)
+
+		expect(client.is_synced).toBe(true)
+		expect(typeof client.mean_path_delay).toBe('bigint')
+		expect(typeof client.last_correction).toBe('bigint')
+		// The master timestamps are identical in both directions and the mock has no transit
+		// time, so the true delay is microseconds. Summing the two terms with the wrong sign
+		// leaves the ~1.7e18ns epoch difference uncancelled instead.
+		expect(client.mean_path_delay).toBeLessThan(1_000_000_000n)
+		expect(client.mean_path_delay).toBeGreaterThan(-1_000_000_000n)
+		client.destroy()
+	})
+})
+
+// ===========================================================================
+// Announce
+// ===========================================================================
+const makeAnnounceBuffer = ({
+	sequence = 1,
+	domain = 0,
+	flags = 0x0000,
+	utcOffset = 37,
+	priority1 = 128,
+	clockClass = 6,
+	clockAccuracy = 0x21,
+	logVariance = 0x4000,
+	priority2 = 128,
+	grandmaster = 'aabbccddeeff0011',
+	stepsRemoved = 0,
+	timeSource = 0x20,
+	logMessageInterval = 1,
+	length = 64,
+}: {
+	sequence?: number
+	domain?: number
+	flags?: number
+	utcOffset?: number
+	priority1?: number
+	clockClass?: number
+	clockAccuracy?: number
+	logVariance?: number
+	priority2?: number
+	grandmaster?: string
+	stepsRemoved?: number
+	timeSource?: number
+	logMessageInterval?: number
+	length?: number
+} = {}): Buffer => {
+	const buf = Buffer.alloc(Math.max(length, 64), 0)
+	buf.writeUInt8(0x0b, 0)
+	buf.writeUInt8(2, 1)
+	buf.writeUInt16BE(64, 2)
+	buf.writeUInt8(domain, 4)
+	buf.writeUInt16BE(flags, 6)
+	Buffer.from('112233445566aabb', 'hex').copy(buf, 20)
+	buf.writeUInt16BE(sequence, 30)
+	buf.writeInt8(logMessageInterval, 33)
+	buf.writeInt16BE(utcOffset, 44)
+	buf.writeUInt8(priority1, 47)
+	buf.writeUInt8(clockClass, 48)
+	buf.writeUInt8(clockAccuracy, 49)
+	buf.writeUInt16BE(logVariance, 50)
+	buf.writeUInt8(priority2, 52)
+	Buffer.from(grandmaster, 'hex').copy(buf, 53)
+	buf.writeUInt16BE(stepsRemoved, 61)
+	buf.writeUInt8(timeSource, 63)
+	return buf.subarray(0, length)
+}
+
+describe('Announce', () => {
+	it('decodes the grandmaster properties', async () => {
+		const client = await makeClient()
+		const spy = vi.fn()
+		client.on('announce', spy)
+		generalSocket().emit('message', makeAnnounceBuffer(), rinfo)
+
+		const gm = client.grandmaster
+		expect(gm).toBeDefined()
+		expect(gm?.grandmasterIdentity).toBe('aa-bb-cc-dd-ee-ff-00-11')
+		expect(gm?.clockClass).toBe(6)
+		expect(gm?.clockClassLabel).toBe('Locked to primary reference')
+		expect(gm?.clockAccuracy).toBe(0x21)
+		expect(gm?.clockAccuracyLabel).toBe('100ns')
+		expect(gm?.timeSource).toBe(0x20)
+		expect(gm?.timeSourceLabel).toBe('GNSS')
+		expect(gm?.currentUtcOffset).toBe(37)
+		expect(gm?.stepsRemoved).toBe(0)
+		expect(gm?.grandmasterPriority1).toBe(128)
+		expect(gm?.logMessageInterval).toBe(1)
+		expect(spy).toHaveBeenCalledTimes(1)
+		client.destroy()
+	})
+
+	it('reports a grandmaster distinct from the sending port', async () => {
+		const client = await makeClient()
+		// A boundary clock relays Sync under its own identity while the grandmaster is elsewhere
+		eventSocket().emit('message', makeSyncBuffer({ source: '112233445566aabb' }), rinfo)
+		generalSocket().emit('message', makeAnnounceBuffer({ grandmaster: 'aabbccddeeff0011', stepsRemoved: 2 }), rinfo)
+
+		expect(client.ptp_master[0]).toBe('11-22-33-44-55-66-aa-bb:0')
+		expect(client.grandmaster?.grandmasterIdentity).toBe('aa-bb-cc-dd-ee-ff-00-11')
+		expect(client.grandmaster?.stepsRemoved).toBe(2)
+		client.destroy()
+	})
+
+	it('emits only when the advertised properties change', async () => {
+		const client = await makeClient()
+		const spy = vi.fn()
+		client.on('announce', spy)
+		generalSocket().emit('message', makeAnnounceBuffer({ sequence: 1 }), rinfo)
+		generalSocket().emit('message', makeAnnounceBuffer({ sequence: 2 }), rinfo)
+		expect(spy).toHaveBeenCalledTimes(1)
+
+		generalSocket().emit('message', makeAnnounceBuffer({ sequence: 3, clockClass: 7 }), rinfo)
+		expect(spy).toHaveBeenCalledTimes(2)
+		expect(client.grandmaster?.clockClassLabel).toBe('Holdover (was primary reference)')
+		client.destroy()
+	})
+
+	it('ignores a truncated Announce', async () => {
+		const client = await makeClient()
+		generalSocket().emit('message', makeAnnounceBuffer({ length: 50 }), rinfo)
+		expect(client.grandmaster).toBeUndefined()
+		client.destroy()
+	})
+
+	it('records the time of the last Announce', async () => {
+		const client = await makeClient()
+		expect(client.last_announce).toBe(0)
+		generalSocket().emit('message', makeAnnounceBuffer(), rinfo)
+		expect(client.last_announce).toBeGreaterThan(0)
+		client.destroy()
+	})
+
+	it('labels an unrecognised accuracy and time source numerically', async () => {
+		const client = await makeClient()
+		generalSocket().emit('message', makeAnnounceBuffer({ clockAccuracy: 0xfe, timeSource: 0x77 }), rinfo)
+		expect(client.grandmaster?.clockAccuracyLabel).toBe('Unknown')
+		expect(client.grandmaster?.timeSourceLabel).toBe('Unknown (0x77)')
+		client.destroy()
+	})
+})
+
+// ===========================================================================
+// flagField decoding
+// ===========================================================================
+describe('flagField decoding', () => {
+	it('decodes twoStep from a Sync', async () => {
+		const client = await makeClient()
+		eventSocket().emit('message', makeSyncBuffer({ flags: 0x0200 }), rinfo)
+		expect(client.ptp_flags.twoStep).toBe(true)
+		client.destroy()
+	})
+
+	it('decodes the alarm-worthy bits from an Announce', async () => {
+		const client = await makeClient()
+		// leap61 | utcOffsetValid | ptpTimescale | timeTraceable | frequencyTraceable
+		generalSocket().emit('message', makeAnnounceBuffer({ flags: 0x003d }), rinfo)
+		const f = client.ptp_flags
+		expect(f.leap61).toBe(true)
+		expect(f.leap59).toBe(false)
+		expect(f.currentUtcOffsetValid).toBe(true)
+		expect(f.ptpTimescale).toBe(true)
+		expect(f.timeTraceable).toBe(true)
+		expect(f.frequencyTraceable).toBe(true)
+		client.destroy()
+	})
+
+	it('decodes alternateMaster and unicast from byte 6', async () => {
+		const client = await makeClient()
+		generalSocket().emit('message', makeAnnounceBuffer({ flags: 0x0500 }), rinfo)
+		expect(client.ptp_flags.alternateMaster).toBe(true)
+		expect(client.ptp_flags.unicast).toBe(true)
+		client.destroy()
+	})
+
+	it('emits flags_changed only on an actual change', async () => {
+		const client = await makeClient()
+		const spy = vi.fn()
+		client.on('flags_changed', spy)
+		generalSocket().emit('message', makeAnnounceBuffer({ flags: 0x0008 }), rinfo)
+		generalSocket().emit('message', makeAnnounceBuffer({ flags: 0x0008 }), rinfo)
+		expect(spy).toHaveBeenCalledTimes(1)
+		generalSocket().emit('message', makeAnnounceBuffer({ flags: 0x0009 }), rinfo)
+		expect(spy).toHaveBeenCalledTimes(2)
+		client.destroy()
+	})
+})
+
+// ===========================================================================
+// master portIdentity
+// ===========================================================================
+describe('master portIdentity', () => {
+	it('reports the real portNumber rather than a hardcoded 0', async () => {
+		const client = await makeClient()
+		const buf = makeSyncBuffer({ source: 'aabbccddeeff0011' })
+		buf.writeUInt16BE(3, 28) // portNumber 3 on a multi-port boundary clock
+		eventSocket().emit('message', buf, rinfo)
+		expect(client.ptp_master[0]).toBe('aa-bb-cc-dd-ee-ff-00-11:3')
+		client.destroy()
+	})
+})
+
+// ===========================================================================
+// flag scoping: Announce-only bits must survive a Sync
+// ===========================================================================
+describe('flag scoping', () => {
+	it('a Sync does not clear the time-property flags reported by Announce', async () => {
+		const client = await makeClient()
+		// utcOffsetValid | ptpTimescale | timeTraceable | frequencyTraceable
+		generalSocket().emit('message', makeAnnounceBuffer({ flags: 0x003c }), rinfo)
+		expect(client.ptp_flags.timeTraceable).toBe(true)
+
+		// IEEE 1588-2008 Table 20: a Sync transmits those bits as false and they must be
+		// ignored on receipt, not taken as a loss of traceability
+		eventSocket().emit('message', makeSyncBuffer({ flags: 0x0000 }), rinfo)
+		expect(client.ptp_flags.timeTraceable).toBe(true)
+		expect(client.ptp_flags.frequencyTraceable).toBe(true)
+		expect(client.ptp_flags.currentUtcOffsetValid).toBe(true)
+		expect(client.ptp_flags.ptpTimescale).toBe(true)
+		client.destroy()
+	})
+
+	it('still takes twoStep from the Sync', async () => {
+		const client = await makeClient()
+		generalSocket().emit('message', makeAnnounceBuffer({ flags: 0x0000 }), rinfo)
+		eventSocket().emit('message', makeSyncBuffer({ flags: 0x0200 }), rinfo)
+		expect(client.ptp_flags.twoStep).toBe(true)
+		client.destroy()
+	})
+
+	it('clears traceability when a later Announce says so', async () => {
+		const client = await makeClient()
+		generalSocket().emit('message', makeAnnounceBuffer({ flags: 0x003c }), rinfo)
+		generalSocket().emit('message', makeAnnounceBuffer({ flags: 0x0008 }), rinfo)
+		expect(client.ptp_flags.timeTraceable).toBe(false)
+		client.destroy()
+	})
+})
+
+// ===========================================================================
+// last_correction bootstrap
+// ===========================================================================
+describe('last_correction', () => {
+	const exchange = async (client: Awaited<ReturnType<typeof makeClient>>, seq: number) => {
+		eventSocket().emit('message', makeSyncBuffer({ flags: 0x0000, sequence: seq, tsSecondsLow: 1_700_000_000 }), rinfo)
+		await new Promise<void>((r) => setImmediate(r))
+		generalSocket().emit('message', makeDelayRespBuffer(client, { sequence: seq, tsSecondsLow: 1_700_000_000 }), rinfo)
+	}
+
+	it('reports zero for the first exchange rather than the epoch acquisition', async () => {
+		const client = await makeClient('0.0.0.0', 0, 125)
+		await exchange(client, 1)
+		// the raw value here is ~-1.7e18, which is initial acquisition and not drift —
+		// and would lose precision as a Number in a Companion variable
+		expect(client.last_correction).toBe(0n)
+		expect(client.is_synced).toBe(true)
+		client.destroy()
+	})
+
+	it('reports a real drift figure once acquired', async () => {
+		const client = await makeClient('0.0.0.0', 0, 125)
+		await exchange(client, 1)
+		await new Promise<void>((r) => setTimeout(r, 150))
+		await exchange(client, 2)
+		// second exchange works from an acquired offset, so the correction is small
+		expect(client.last_correction).toBeLessThan(1_000_000_000n)
+		expect(client.last_correction).toBeGreaterThan(-1_000_000_000n)
+		client.destroy()
+	})
+})
+
+// ===========================================================================
+// Receipt timeouts (IEEE 1588-2008 §7.7.3.1)
+// ===========================================================================
+describe('receipt timeouts', () => {
+	/** Write logMessageInterval (signed log2 seconds) into byte 33 */
+	const withLogInterval = (buf: Buffer, logInterval: number): Buffer => {
+		buf.writeInt8(logInterval, 33)
+		return buf
+	}
+
+	it('derives the sync receipt timeout from the interval the master advertises', async () => {
+		const client = await makeClient('0.0.0.0', 0, 125)
+		// logSyncInterval 0 -> 1s interval, x3 = 3000ms
+		eventSocket().emit('message', withLogInterval(makeSyncBuffer({ flags: 0x0200 }), 0), rinfo)
+		expect(client.sync_receipt_timeout).toBe(3000)
+		expect(client.sync_interval).toBe(1)
+
+		// logSyncInterval -3 -> 125ms interval, x3 = 375ms (a common broadcast rate)
+		eventSocket().emit('message', withLogInterval(makeSyncBuffer({ flags: 0x0200 }), -3), rinfo)
+		expect(client.sync_receipt_timeout).toBe(375)
+		expect(client.sync_interval).toBe(0.125)
+		client.destroy()
+	})
+
+	it('derives the announce receipt timeout from the Announce interval', async () => {
+		const client = await makeClient()
+		// logAnnounceInterval 1 -> 2s interval, x3 = 6000ms, the IEEE 1588 default
+		generalSocket().emit('message', makeAnnounceBuffer({ logMessageInterval: 1 }), rinfo)
+		expect(client.announce_receipt_timeout).toBe(6000)
+
+		generalSocket().emit('message', makeAnnounceBuffer({ logMessageInterval: -2, clockClass: 7 }), rinfo)
+		expect(client.announce_receipt_timeout).toBe(750)
+		client.destroy()
+	})
+
+	it('clamps an absurd advertised interval', async () => {
+		const client = await makeClient()
+		generalSocket().emit('message', makeAnnounceBuffer({ logMessageInterval: 100 }), rinfo)
+		expect(client.announce_receipt_timeout).toBe(48_000) // 16s cap x3
+		generalSocket().emit('message', makeAnnounceBuffer({ logMessageInterval: -100, clockClass: 7 }), rinfo)
+		expect(client.announce_receipt_timeout).toBeGreaterThan(0)
+		client.destroy()
+	})
+
+	it('drops sync when no Sync arrives within the receipt timeout', async () => {
+		// setImmediate must stay real — makeClient and sendDelayReq both rely on it
+		vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
+		try {
+			const client = await makeClient('0.0.0.0', 0, 125)
+			const lost = vi.fn()
+			client.on('master_lost', lost)
+
+			eventSocket().emit('message', withLogInterval(makeSyncBuffer({ flags: 0x0000 }), 0), rinfo)
+			await vi.advanceTimersByTimeAsync(1)
+			generalSocket().emit('message', makeDelayRespBuffer(client, { sequence: 1 }), rinfo)
+			expect(client.is_synced).toBe(true)
+
+			// still inside the timeout
+			await vi.advanceTimersByTimeAsync(2500)
+			expect(client.is_synced).toBe(true)
+
+			// past 3 x 1s with no further Sync
+			await vi.advanceTimersByTimeAsync(1000)
+			expect(client.is_synced).toBe(false)
+			expect(lost).toHaveBeenCalled()
+			client.destroy()
+		} finally {
+			vi.useRealTimers()
+		}
+	})
+
+	it('a continuing flow of Sync messages holds sync up', async () => {
+		// setImmediate must stay real — makeClient and sendDelayReq both rely on it
+		vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
+		try {
+			const client = await makeClient('0.0.0.0', 0, 125)
+			eventSocket().emit('message', withLogInterval(makeSyncBuffer({ flags: 0x0000 }), 0), rinfo)
+			await vi.advanceTimersByTimeAsync(1)
+			generalSocket().emit('message', makeDelayRespBuffer(client, { sequence: 1 }), rinfo)
+			expect(client.is_synced).toBe(true)
+
+			// a Sync every second re-arms the timeout, well past the 3s it would otherwise expire at
+			for (let i = 0; i < 8; i++) {
+				await vi.advanceTimersByTimeAsync(1000)
+				eventSocket().emit('message', withLogInterval(makeSyncBuffer({ flags: 0x0200, sequence: i }), 0), rinfo)
+			}
+			expect(client.is_synced).toBe(true)
+			client.destroy()
+		} finally {
+			vi.useRealTimers()
+		}
+	})
+
+	it('drops the grandmaster when the announce receipt timeout expires', async () => {
+		// setImmediate must stay real — makeClient and sendDelayReq both rely on it
+		vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
+		try {
+			const client = await makeClient()
+			const lost = vi.fn()
+			client.on('master_lost', lost)
+			generalSocket().emit('message', makeAnnounceBuffer({ logMessageInterval: 1 }), rinfo)
+			expect(client.grandmaster).toBeDefined()
+
+			await vi.advanceTimersByTimeAsync(5500)
+			expect(client.grandmaster).toBeDefined()
+
+			await vi.advanceTimersByTimeAsync(1000)
+			// stale grandmaster data is dropped rather than left on display
+			expect(client.grandmaster).toBeUndefined()
+			expect(lost).toHaveBeenCalledWith(expect.stringContaining('Announce'))
+			client.destroy()
+		} finally {
+			vi.useRealTimers()
+		}
+	})
+})
+
+// ===========================================================================
+// IEEE 1588-2019 (PTP v2.1) compatibility
+// ===========================================================================
+describe('IEEE 1588-2019 compatibility', () => {
+	/**
+	 * 1588-2019 redefined the upper nibble of byte 1 — reserved in 2008 — as minorVersionPTP,
+	 * so a 2019 device sends 0x12 where a 2008 device sends 0x02. Comparing the whole byte
+	 * against 2 discards every packet from a 2019 grandmaster.
+	 */
+	const withVersionByte = (buf: Buffer, versionByte: number): Buffer => {
+		buf.writeUInt8(versionByte, 1)
+		return buf
+	}
+
+	it('accepts a Sync from a 1588-2019 master', async () => {
+		const client = await makeClient('0.0.0.0', 0, 125)
+		eventSocket().emit(
+			'message',
+			withVersionByte(makeSyncBuffer({ flags: 0x0000, source: 'aabbccddeeff0011' }), 0x12),
+			rinfo,
+		)
+		expect(client.ptp_master[0]).toBe('aa-bb-cc-dd-ee-ff-00-11:0')
+		expect(client.ptp_version).toBe('2.1')
+		client.destroy()
+	})
+
+	it('accepts an Announce from a 1588-2019 master', async () => {
+		const client = await makeClient()
+		generalSocket().emit('message', withVersionByte(makeAnnounceBuffer(), 0x12), rinfo)
+		expect(client.grandmaster?.grandmasterIdentity).toBe('aa-bb-cc-dd-ee-ff-00-11')
+		expect(client.ptp_version).toBe('2.1')
+		client.destroy()
+	})
+
+	it('completes a full exchange with a 1588-2019 master', async () => {
+		const client = await makeClient('0.0.0.0', 0, 125)
+		eventSocket().emit(
+			'message',
+			withVersionByte(makeSyncBuffer({ flags: 0x0000, tsSecondsLow: 1_700_000_000 }), 0x12),
+			rinfo,
+		)
+		await new Promise<void>((r) => setImmediate(r))
+		generalSocket().emit(
+			'message',
+			withVersionByte(makeDelayRespBuffer(client, { sequence: 1, tsSecondsLow: 1_700_000_000 }), 0x12),
+			rinfo,
+		)
+		expect(client.is_synced).toBe(true)
+		client.destroy()
+	})
+
+	it('still reports 2.0 for a 1588-2008 master', async () => {
+		const client = await makeClient()
+		eventSocket().emit('message', makeSyncBuffer({ flags: 0x0000 }), rinfo)
+		expect(client.ptp_version).toBe('2.0')
+		client.destroy()
+	})
+
+	it('emits version_changed when the minor version changes', async () => {
+		const client = await makeClient()
+		const spy = vi.fn()
+		client.on('version_changed', spy)
+		eventSocket().emit('message', makeSyncBuffer({ flags: 0x0000 }), rinfo)
+		expect(spy).not.toHaveBeenCalled() // 2.0 is the starting assumption
+
+		eventSocket().emit('message', withVersionByte(makeSyncBuffer({ flags: 0x0000 }), 0x12), rinfo)
+		expect(spy).toHaveBeenCalledWith('2.1')
+		client.destroy()
+	})
+
+	it('still rejects a genuinely wrong major version', async () => {
+		const client = await makeClient()
+		// PTPv1 (version 1) must still be ignored, minor nibble or not
+		eventSocket().emit('message', withVersionByte(makeSyncBuffer({ source: 'aabbccddeeff0011' }), 0x11), rinfo)
+		expect(client.ptp_master[0]).toBe('')
+		client.destroy()
+	})
+
+	it('masks the majorSdoId nibble of byte 0 when reading message type', async () => {
+		const client = await makeClient()
+		// 2019 renamed byte 0's upper nibble from transportSpecific to majorSdoId; a non-zero
+		// value there must not stop a Sync being recognised as a Sync
+		const buf = makeSyncBuffer({ flags: 0x0000, source: 'aabbccddeeff0011' })
+		buf.writeUInt8(0x10, 0) // majorSdoId 1, messageType 0 (Sync)
+		eventSocket().emit('message', buf, rinfo)
+		expect(client.ptp_master[0]).toBe('aa-bb-cc-dd-ee-ff-00-11:0')
+		client.destroy()
+	})
+})
+
+// ===========================================================================
+// Identifying the grandmaster beyond its clock identity
+// ===========================================================================
+describe('grandmaster identification', () => {
+	it('recovers the MAC from an EUI-64 derived clock identity', async () => {
+		const client = await makeClient()
+		// 00:1b:19:12:34:56 becomes 00:1b:19:ff:fe:12:34:56 per IEEE 1588 §7.5.2.2.2
+		generalSocket().emit('message', makeAnnounceBuffer({ grandmaster: '001b19fffe123456' }), rinfo)
+		expect(client.grandmaster?.grandmasterMac).toBe('00:1b:19:12:34:56')
+		expect(client.grandmaster?.grandmasterOui).toBe('00:1b:19')
+		client.destroy()
+	})
+
+	it('returns no MAC for an identity that was not derived from one', async () => {
+		const client = await makeClient()
+		// no ff:fe marker at bytes 3-4, so there is no MAC to recover and none is guessed
+		generalSocket().emit('message', makeAnnounceBuffer({ grandmaster: 'aabbccddeeff0011' }), rinfo)
+		expect(client.grandmaster?.grandmasterMac).toBeUndefined()
+		// the OUI is still the manufacturer block
+		expect(client.grandmaster?.grandmasterOui).toBe('aa:bb:cc')
+		client.destroy()
+	})
+
+	it('recovers the MAC of the port sending Sync', async () => {
+		const client = await makeClient()
+		eventSocket().emit('message', makeSyncBuffer({ source: 'dc045afffe064144' }), rinfo)
+		expect(client.ptp_master_mac).toBe('dc:04:5a:06:41:44')
+		expect(client.ptp_master_oui).toBe('dc:04:5a')
+		client.destroy()
+	})
+
+	it('reports the grandmaster address when the Announce came straight from it', async () => {
+		const client = await makeClient()
+		generalSocket().emit('message', makeAnnounceBuffer({ stepsRemoved: 0 }), rinfo)
+		expect(client.grandmaster_address).toBe(rinfo.address)
+		client.destroy()
+	})
+
+	it('reports no grandmaster address when it is behind a boundary clock', async () => {
+		const client = await makeClient()
+		// The source address belongs to the boundary clock that relayed the Announce, and PTP
+		// carries no field for the grandmaster's own address, so claiming one would be wrong
+		generalSocket().emit('message', makeAnnounceBuffer({ stepsRemoved: 2 }), rinfo)
+		expect(client.grandmaster?.stepsRemoved).toBe(2)
+		expect(client.grandmaster_address).toBe('')
+		client.destroy()
+	})
+
+	it('clears the grandmaster address when the announce receipt timeout expires', async () => {
+		// setImmediate must stay real — makeClient and sendDelayReq both rely on it
+		vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
+		try {
+			const client = await makeClient()
+			generalSocket().emit('message', makeAnnounceBuffer({ stepsRemoved: 0, logMessageInterval: 1 }), rinfo)
+			expect(client.grandmaster_address).toBe(rinfo.address)
+			await vi.advanceTimersByTimeAsync(6500)
+			expect(client.grandmaster_address).toBe('')
+			client.destroy()
+		} finally {
+			vi.useRealTimers()
+		}
+	})
+
+	it('round-trips our own identity back to the interface MAC', async () => {
+		const client = await makeClient()
+		// the client derives its own identity from a local MAC the same way, so the reverse
+		// of that derivation must land back on a well-formed MAC
+		const identity = client.clock_identity
+		expect(identity).toMatch(/^[0-9a-f]{16}$/)
+		if (identity.slice(6, 10) === 'fffe') {
+			const buf = Buffer.from(identity, 'hex')
+			const mac = [buf[0], buf[1], buf[2], buf[5], buf[6], buf[7]].map((b) => b.toString(16).padStart(2, '0')).join(':')
+			expect(mac).toMatch(/^([0-9a-f]{2}:){5}[0-9a-f]{2}$/)
+		}
+		client.destroy()
+	})
+})
+
+// ===========================================================================
+// The socket's receive buffer is not ours to hold
+// ===========================================================================
+describe('receive buffer ownership', () => {
+	it('keeps the master identity after the source buffer is overwritten', async () => {
+		const client = await makeClient()
+		const buf = makeSyncBuffer({ source: 'dc045afffe064144' })
+		eventSocket().emit('message', buf, rinfo)
+		expect(client.ptp_master_mac).toBe('dc:04:5a:06:41:44')
+
+		// Node reads UDP datagrams into a shared slab, so a subarray of the received buffer
+		// aliases memory the runtime may reuse. The identity must have been copied out.
+		buf.fill(0, 20, 28)
+		expect(client.ptp_master_mac).toBe('dc:04:5a:06:41:44')
+		expect(client.ptp_master_oui).toBe('dc:04:5a')
+		client.destroy()
+	})
+})
+
+// ===========================================================================
+// PATH_TRACE TLV (IEEE 1588-2019 §16.2)
+// ===========================================================================
+/** Append a PATH_TRACE TLV (type 0x0008) carrying the given clock identities */
+const withPathTrace = (announce: Buffer, identities: string[]): Buffer => {
+	const value = Buffer.concat(identities.map((id) => Buffer.from(id, 'hex')))
+	const tlv = Buffer.alloc(4 + value.length)
+	tlv.writeUInt16BE(0x0008, 0)
+	tlv.writeUInt16BE(value.length, 2)
+	value.copy(tlv, 4)
+	const out = Buffer.concat([announce, tlv])
+	out.writeUInt16BE(out.length, 2) // messageLength must cover the TLVs
+	return out
+}
+
+describe('PATH_TRACE TLV', () => {
+	const GM = '001b19fffe123456'
+	const BC1 = 'aabbccfffe111111'
+	const BC2 = 'ddeeffffe2222222'.slice(0, 16)
+
+	it('decodes the clock identity chain', async () => {
+		const client = await makeClient()
+		generalSocket().emit(
+			'message',
+			withPathTrace(makeAnnounceBuffer({ grandmaster: GM, stepsRemoved: 2 }), [GM, BC1, BC2]),
+			rinfo,
+		)
+		expect(client.path_trace).toEqual(['00-1b-19-ff-fe-12-34-56', 'aa-bb-cc-ff-fe-11-11-11', 'dd-ee-ff-ff-e2-22-22-22'])
+		client.destroy()
+	})
+
+	it('puts the grandmaster first and the transmitting clock last', async () => {
+		const client = await makeClient()
+		generalSocket().emit('message', withPathTrace(makeAnnounceBuffer({ grandmaster: GM }), [GM, BC1]), rinfo)
+		const path = client.path_trace
+		expect(path[0]).toBe(client.grandmaster?.grandmasterIdentity)
+		expect(path[path.length - 1]).toBe('aa-bb-cc-ff-fe-11-11-11')
+		client.destroy()
+	})
+
+	it('is empty when the master emits no PATH_TRACE, which is the common case', async () => {
+		const client = await makeClient()
+		generalSocket().emit('message', makeAnnounceBuffer(), rinfo)
+		expect(client.path_trace).toEqual([])
+		expect(client.grandmaster?.pathTraceLoop).toBe(false)
+		client.destroy()
+	})
+
+	it('skips over the whole value of a TLV of another type', async () => {
+		const client = await makeClient()
+		// The preceding TLV's value contains bytes that look like a PATH_TRACE header. A walk
+		// that advances by the header only, rather than header + value, lands inside this
+		// value and returns the decoy instead of the real path.
+		const decoy = Buffer.alloc(12)
+		decoy.writeUInt16BE(0x0008, 0)
+		decoy.writeUInt16BE(8, 2)
+		decoy.fill(0xaa, 4)
+		const other = Buffer.alloc(4 + decoy.length)
+		other.writeUInt16BE(0x0003, 0)
+		other.writeUInt16BE(decoy.length, 2)
+		decoy.copy(other, 4)
+
+		const announce = Buffer.concat([makeAnnounceBuffer({ grandmaster: GM }), other])
+		announce.writeUInt16BE(announce.length, 2)
+		generalSocket().emit('message', withPathTrace(announce, [GM, BC1]), rinfo)
+
+		expect(client.path_trace).toEqual(['00-1b-19-ff-fe-12-34-56', 'aa-bb-cc-ff-fe-11-11-11'])
+		client.destroy()
+	})
+
+	it('flags a repeated identity as a loop', async () => {
+		const client = await makeClient()
+		generalSocket().emit('message', withPathTrace(makeAnnounceBuffer({ grandmaster: GM }), [GM, BC1, GM]), rinfo)
+		expect(client.grandmaster?.pathTraceLoop).toBe(true)
+		client.destroy()
+	})
+
+	it('does not flag a loop for a clean path', async () => {
+		const client = await makeClient()
+		generalSocket().emit('message', withPathTrace(makeAnnounceBuffer({ grandmaster: GM }), [GM, BC1, BC2]), rinfo)
+		expect(client.grandmaster?.pathTraceLoop).toBe(false)
+		client.destroy()
+	})
+
+	it('ignores a TLV whose value is not a whole number of identities', async () => {
+		const client = await makeClient()
+		const announce = makeAnnounceBuffer({ grandmaster: GM })
+		const tlv = Buffer.alloc(4 + 12) // 12 bytes is not a multiple of 8
+		tlv.writeUInt16BE(0x0008, 0)
+		tlv.writeUInt16BE(12, 2)
+		const buf = Buffer.concat([announce, tlv])
+		buf.writeUInt16BE(buf.length, 2)
+		generalSocket().emit('message', buf, rinfo)
+		expect(client.path_trace).toEqual([])
+		client.destroy()
+	})
+
+	it('ignores a TLV that runs past the end of the message', async () => {
+		const client = await makeClient()
+		// Claims two identities but carries one. subarray would silently clamp to the single
+		// identity present, so without a bounds check this reports a plausible but wrong path.
+		const tlv = Buffer.alloc(4 + 8)
+		tlv.writeUInt16BE(0x0008, 0)
+		tlv.writeUInt16BE(16, 2)
+		Buffer.from(GM, 'hex').copy(tlv, 4)
+		const buf = Buffer.concat([makeAnnounceBuffer({ grandmaster: GM }), tlv])
+		buf.writeUInt16BE(buf.length, 2)
+		generalSocket().emit('message', buf, rinfo)
+		expect(client.path_trace).toEqual([])
+		client.destroy()
+	})
+
+	it('ignores TLV bytes beyond the declared messageLength', async () => {
+		const client = await makeClient()
+		// UDP payloads can be padded; only messageLength delimits the PTP message
+		const buf = withPathTrace(makeAnnounceBuffer({ grandmaster: GM }), [GM, BC1])
+		buf.writeUInt16BE(64, 2) // declare the message as ending before the TLV
+		generalSocket().emit('message', buf, rinfo)
+		expect(client.path_trace).toEqual([])
+		client.destroy()
+	})
+
+	it('does not re-emit announce when an identical path repeats', async () => {
+		const client = await makeClient()
+		const spy = vi.fn()
+		client.on('announce', spy)
+		const buf = () => withPathTrace(makeAnnounceBuffer({ grandmaster: GM }), [GM, BC1])
+		generalSocket().emit('message', buf(), rinfo)
+		generalSocket().emit('message', buf(), rinfo)
+		// pathTrace is an array, so a reference comparison here would fire every time
+		expect(spy).toHaveBeenCalledTimes(1)
+		client.destroy()
+	})
+
+	it('re-emits announce when the path changes', async () => {
+		const client = await makeClient()
+		const spy = vi.fn()
+		client.on('announce', spy)
+		generalSocket().emit('message', withPathTrace(makeAnnounceBuffer({ grandmaster: GM }), [GM, BC1]), rinfo)
+		generalSocket().emit('message', withPathTrace(makeAnnounceBuffer({ grandmaster: GM }), [GM, BC2]), rinfo)
+		expect(spy).toHaveBeenCalledTimes(2)
+		client.destroy()
+	})
+})
+
+// ===========================================================================
+// Manufacturer lookup
+// ===========================================================================
+describe('manufacturer lookup', () => {
+	/** Build an EUI-64 clock identity from a MAC, the way a device would */
+	const identityFor = (mac: string): string => {
+		const b = mac.replace(/:/g, '')
+		return b.slice(0, 6) + 'fffe' + b.slice(6)
+	}
+
+	it('names the manufacturer of a 24-bit assignment', async () => {
+		const client = await makeClient()
+		// 00:07:7D is Cisco
+		generalSocket().emit('message', makeAnnounceBuffer({ grandmaster: identityFor('00:07:7d:11:22:33') }), rinfo)
+		expect(client.grandmaster?.grandmasterVendor).toContain('Cisco')
+		expect(client.grandmaster?.grandmasterOui).toBe('00:07:7d')
+		client.destroy()
+	})
+
+	it('names the manufacturer of the port sending Sync', async () => {
+		const client = await makeClient()
+		eventSocket().emit('message', makeSyncBuffer({ source: identityFor('00:07:7d:44:55:66') }), rinfo)
+		expect(client.ptp_master_vendor).toContain('Cisco')
+		client.destroy()
+	})
+
+	it('resolves a 36-bit assignment that a bare OUI could not', async () => {
+		const client = await makeClient()
+		// 00:50:C2 is the shared IEEE IAB pool; only the longer prefix identifies the holder.
+		// 00:50:C2:22:6 is Ross Video.
+		generalSocket().emit('message', makeAnnounceBuffer({ grandmaster: identityFor('00:50:c2:22:60:01') }), rinfo)
+		expect(client.grandmaster?.grandmasterVendor).toContain('Ross Video')
+		client.destroy()
+	})
+
+	it('leaves the vendor undefined for a block we do not carry', async () => {
+		const client = await makeClient()
+		// aa:bb:cc is not a real assignment, and a wrong name is worse than none
+		generalSocket().emit('message', makeAnnounceBuffer({ grandmaster: 'aabbccddeeff0011' }), rinfo)
+		expect(client.grandmaster?.grandmasterVendor).toBeUndefined()
+		expect(client.grandmaster?.grandmasterOui).toBe('aa:bb:cc')
+		client.destroy()
+	})
+
+	it('falls back to the 24-bit block when the identity is not MAC-derived', async () => {
+		const client = await makeClient()
+		// no ff:fe marker, so there is no MAC and only the OUI can be matched
+		generalSocket().emit('message', makeAnnounceBuffer({ grandmaster: '00077d1122334455' }), rinfo)
+		expect(client.grandmaster?.grandmasterVendor).toContain('Cisco')
+		client.destroy()
+	})
+})
+
+// ===========================================================================
+// OUI table integrity
+// ===========================================================================
+describe('OUI table', () => {
+	it('holds only 24, 28 and 36 bit prefixes, all valid hex', async () => {
+		const { ouiPrefixes, ouiNames } = await import('../oui.js')
+		const lengths = new Set<number>()
+		for (const [prefix, index] of Object.entries(ouiPrefixes)) {
+			expect(prefix).toMatch(/^[0-9A-F]+$/)
+			lengths.add(prefix.length)
+			expect(ouiNames[index]).toBeTruthy()
+		}
+		expect([...lengths].sort((a, b) => a - b)).toEqual([6, 7, 9])
+	})
+
+	it('has no longer prefix that contradicts its 24-bit parent', async () => {
+		const { ouiPrefixes, ouiNames } = await import('../oui.js')
+		// MA-M and MA-S blocks are carved from pools IEEE holds itself (00:50:C2, 00:1B:C5,
+		// 70:B3:D5), never from another company's MA-L, so a disagreement here would mean the
+		// source data is wrong. It also means longest-prefix order cannot currently change a
+		// result — this test is what keeps that true.
+		const conflicts: string[] = []
+		for (const [prefix, index] of Object.entries(ouiPrefixes)) {
+			if (prefix.length === 6) continue
+			const parent = ouiPrefixes[prefix.slice(0, 6)]
+			if (parent !== undefined && parent !== index) {
+				conflicts.push(`${prefix}=${ouiNames[index]} under ${prefix.slice(0, 6)}=${ouiNames[parent]}`)
+			}
+		}
+		expect(conflicts).toEqual([])
+	})
+
+	it('resolves known vendors', async () => {
+		const { lookupOui } = await import('../oui.js')
+		expect(lookupOui('EC4670112233')).toContain('Meinberg')
+		expect(lookupOui('0002C5112233')).toContain('Evertz')
+		expect(lookupOui('000B72112233')).toContain('Lawo')
+		expect(lookupOui('00077D112233')).toContain('Cisco')
+		expect(lookupOui('0050C2226001')).toContain('Ross Video')
+	})
+
+	it('tolerates separators and lower case', async () => {
+		const { lookupOui } = await import('../oui.js')
+		expect(lookupOui('ec:46:70:11:22:33')).toContain('Meinberg')
+		expect(lookupOui('ec-46-70')).toContain('Meinberg')
+	})
+
+	it('returns undefined rather than guessing', async () => {
+		const { lookupOui } = await import('../oui.js')
+		expect(lookupOui('AABBCC112233')).toBeUndefined()
+		expect(lookupOui('0050C2999999')).toBeUndefined() // IEEE pool, no matching sub-block
+		expect(lookupOui('')).toBeUndefined()
+		expect(lookupOui('AB')).toBeUndefined()
 	})
 })

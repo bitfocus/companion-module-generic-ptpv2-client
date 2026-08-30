@@ -1,6 +1,6 @@
 # PTPv2 Client
 
-Utility module for monitoring PTPv2 (IEEE 1588-2008) on a network the Companion instance is connected to. It is a **passive monitor**: it observes the PTP traffic on the selected interface and reports what the grandmaster is advertising. It does **not** discipline the host system clock, and it does not participate in the Best Master Clock Algorithm.
+Utility module for monitoring PTPv2 (IEEE 1588-2008 / IEEE 1588-2019) on a network the Companion instance is connected to. It is a **passive monitor**: it observes the PTP traffic on the selected interface and reports what the grandmaster is advertising. It does **not** discipline the host system clock, and it does not participate in the Best Master Clock Algorithm.
 
 For detailed protocol-level diagnostics consider Meinberg's PTP Track Hound.
 

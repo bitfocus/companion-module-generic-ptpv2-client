@@ -70,6 +70,7 @@ vi.mock('dgram', () => ({
 // Import AFTER mock is set up so the module picks up the fake dgram
 // ---------------------------------------------------------------------------
 const { PTPv2Client } = await import('../ptpv2.js')
+type DelayMechanism = import('../ptpv2.js').DelayMechanism
 
 // ---------------------------------------------------------------------------
 // Buffer builders
@@ -145,6 +146,36 @@ const makeDelayRespBuffer = (
 	return buf
 }
 
+/**
+ * Build a Pdelay_Req, as a neighbour on the link would transmit it. Only its presence
+ * matters for detection, so the timestamps are irrelevant.
+ */
+const makePdelayReqBuffer = (opts: Parameters<typeof makeSyncBuffer>[0] = {}) =>
+	makeSyncBuffer({ ...opts, type: 0x02, length: 54 })
+
+/**
+ * Build a Pdelay_Resp (type 0x3) or Pdelay_Resp_Follow_Up (type 0xA). Both echo the
+ * requester's portIdentity at bytes 44-53, exactly as a Delay_Resp does, and the client
+ * ignores any response not stamped with its own.
+ */
+const makePdelayRespBuffer = (
+	requester: { clock_identity: string } | undefined,
+	opts: Parameters<typeof makeSyncBuffer>[0] = {},
+): Buffer => {
+	const buf = makeSyncBuffer({ ...opts, type: 0x03, length: 54 })
+	if (requester) Buffer.from(requester.clock_identity + '0001', 'hex').copy(buf, 44)
+	return buf
+}
+
+const makePdelayFollowUpBuffer = (
+	requester: { clock_identity: string } | undefined,
+	opts: Parameters<typeof makeSyncBuffer>[0] = {},
+): Buffer => {
+	const buf = makeSyncBuffer({ ...opts, type: 0x0a, length: 54 })
+	if (requester) Buffer.from(requester.clock_identity + '0001', 'hex').copy(buf, 44)
+	return buf
+}
+
 // Fake rinfo object
 const rinfo = { address: '192.168.1.1', family: 'IPv4', port: 319, size: 44 }
 
@@ -157,9 +188,15 @@ const eventSocket = () => mockSockets[mockSockets.length - 2]
 /** Get the general-socket (port 320) mock for the most-recently created client */
 const generalSocket = () => mockSockets[mockSockets.length - 1]
 
-/** Create a client and wait for both sockets to fire 'listening' */
-const makeClient = async (iface = '0.0.0.0', domain = 0, interval = 125) => {
-	const client = new PTPv2Client(iface, domain, interval)
+/**
+ * Create a client and wait for both sockets to fire 'listening'.
+ *
+ * Defaults to 'e2e' rather than the module's own 'auto', because the bulk of these tests
+ * exercise the end to end exchange and auto mode deliberately transmits nothing until it has
+ * finished listening for peer delay. Auto's own behaviour is covered in its own block.
+ */
+const makeClient = async (iface = '0.0.0.0', domain = 0, interval = 125, mechanism: DelayMechanism = 'e2e') => {
+	const client = new PTPv2Client(iface, domain, interval, mechanism)
 	await new Promise<void>((r) => setImmediate(r)) // let bind → listening fire
 	await new Promise<void>((r) => setImmediate(r))
 	return client
@@ -2123,5 +2160,433 @@ describe('OUI table', () => {
 		expect(lookupOui('0050C2999999')).toBeUndefined() // IEEE pool, no matching sub-block
 		expect(lookupOui('')).toBeUndefined()
 		expect(lookupOui('AB')).toBeUndefined()
+	})
+})
+
+// ===========================================================================
+// Delay mechanism
+// ===========================================================================
+describe('delay mechanism – multicast group membership', () => {
+	const PDELAY_GROUP = '224.0.0.107'
+
+	it.each(['auto', 'p2p', 'passive'] as const)('%s joins the peer delay group', async (mechanism) => {
+		const client = await makeClient('0.0.0.0', 0, 125, mechanism)
+		expect(eventSocket().addMembership).toHaveBeenCalledWith(PDELAY_GROUP, '0.0.0.0')
+		expect(generalSocket().addMembership).toHaveBeenCalledWith(PDELAY_GROUP, '0.0.0.0')
+		client.destroy()
+	})
+
+	it('an explicit e2e has no use for the peer delay group and does not join it', async () => {
+		const client = await makeClient('0.0.0.0', 0, 125, 'e2e')
+		expect(eventSocket().addMembership).not.toHaveBeenCalledWith(PDELAY_GROUP, '0.0.0.0')
+		expect(eventSocket().addMembership).toHaveBeenCalledWith('224.0.1.129', '0.0.0.0')
+		client.destroy()
+	})
+})
+
+describe('delay mechanism – auto detection', () => {
+	/** Drive a one-step Sync, the point at which a transmitting mechanism would react */
+	const feedSync = async () => {
+		eventSocket().emit('message', makeSyncBuffer({ flags: 0x0000, tsSecondsLow: 1_700_000_000 }), rinfo)
+		await new Promise<void>((r) => setImmediate(r))
+	}
+
+	it('starts out undecided', async () => {
+		const client = await makeClient('0.0.0.0', 0, 125, 'auto')
+		expect(client.delay_mechanism).toBe('detecting')
+		client.destroy()
+	})
+
+	it('transmits nothing at all while still undecided', async () => {
+		const client = await makeClient('0.0.0.0', 0, 125, 'auto')
+		await feedSync()
+		// This is the whole point of auto: a Delay_Req here would be the spec violation that
+		// mixing mechanisms on one path amounts to
+		expect(eventSocket().send).not.toHaveBeenCalled()
+		client.destroy()
+	})
+
+	it('settles on p2p the moment a neighbour Pdelay_Req is seen', async () => {
+		const client = await makeClient('0.0.0.0', 0, 125, 'auto')
+		const changed = vi.fn()
+		client.on('delay_mechanism_changed', changed)
+
+		eventSocket().emit('message', makePdelayReqBuffer({ sequence: 7 }), rinfo)
+
+		expect(client.delay_mechanism).toBe('p2p')
+		expect(client.pdelay_seen).toBe(true)
+		expect(changed).toHaveBeenCalledWith('p2p', true)
+		client.destroy()
+	})
+
+	it('settles on p2p from a Pdelay_Resp_Follow_Up on the general socket too', async () => {
+		const client = await makeClient('0.0.0.0', 0, 125, 'auto')
+		generalSocket().emit('message', makePdelayFollowUpBuffer(undefined, { sequence: 3 }), rinfo)
+		expect(client.delay_mechanism).toBe('p2p')
+		client.destroy()
+	})
+
+	it('ignores peer delay traffic belonging to another domain', async () => {
+		const client = await makeClient('0.0.0.0', 1, 125, 'auto')
+		eventSocket().emit('message', makePdelayReqBuffer({ domain: 5 }), rinfo)
+		expect(client.delay_mechanism).toBe('detecting')
+		expect(client.pdelay_seen).toBe(false)
+		client.destroy()
+	})
+
+	it('falls back to e2e once the detection window closes in silence', async () => {
+		vi.useFakeTimers()
+		try {
+			const client = new PTPv2Client('0.0.0.0', 0, 125, 'auto')
+			const changed = vi.fn()
+			client.on('delay_mechanism_changed', changed)
+			expect(client.delay_mechanism).toBe('detecting')
+
+			await vi.advanceTimersByTimeAsync(4000)
+
+			expect(client.delay_mechanism).toBe('e2e')
+			expect(changed).toHaveBeenCalledWith('e2e', true)
+			client.destroy()
+		} finally {
+			vi.useRealTimers()
+		}
+	})
+
+	it('does not revert to e2e after having detected p2p', async () => {
+		vi.useFakeTimers()
+		try {
+			const client = new PTPv2Client('0.0.0.0', 0, 125, 'auto')
+			await vi.advanceTimersByTimeAsync(0)
+			eventSocket().emit('message', makePdelayReqBuffer(), rinfo)
+			await vi.advanceTimersByTimeAsync(10_000)
+			expect(client.delay_mechanism).toBe('p2p')
+			client.destroy()
+		} finally {
+			vi.useRealTimers()
+		}
+	})
+
+	it('an explicit mechanism is settled immediately, with no detection at all', async () => {
+		for (const mechanism of ['e2e', 'p2p', 'passive'] as const) {
+			mockSockets = []
+			const client = await makeClient('0.0.0.0', 0, 125, mechanism)
+			expect(client.delay_mechanism).toBe(mechanism)
+			client.destroy()
+		}
+	})
+})
+
+describe('delay mechanism – passive', () => {
+	it('syncs from the Sync alone, without transmitting anything', async () => {
+		const client = await makeClient('0.0.0.0', 0, 125, 'passive')
+		const synced = vi.fn()
+		client.on('ptp_time_synced', synced)
+
+		eventSocket().emit('message', makeSyncBuffer({ flags: 0x0000, tsSecondsLow: 1_700_000_000 }), rinfo)
+		await new Promise<void>((r) => setImmediate(r))
+
+		expect(synced).toHaveBeenCalled()
+		expect(client.is_synced).toBe(true)
+		expect(eventSocket().send).not.toHaveBeenCalled()
+		client.destroy()
+	})
+
+	it('syncs on the Follow_Up of a two-step master, still without transmitting', async () => {
+		const client = await makeClient('0.0.0.0', 0, 125, 'passive')
+		eventSocket().emit('message', makeSyncBuffer({ flags: 0x0200, sequence: 4 }), rinfo)
+		generalSocket().emit('message', makeFollowUpBuffer({ sequence: 4, tsSecondsLow: 1_700_000_000 }), rinfo)
+		await new Promise<void>((r) => setImmediate(r))
+
+		expect(client.is_synced).toBe(true)
+		expect(eventSocket().send).not.toHaveBeenCalled()
+		client.destroy()
+	})
+
+	it('takes the path delay from the Sync correction field', async () => {
+		// The correctionField is where a P2P domain's transparent clocks accumulate the path,
+		// so a larger correction must move the derived time by the whole of that amount
+		const timeFor = async (correction: number): Promise<bigint> => {
+			mockSockets = []
+			const client = await makeClient('0.0.0.0', 0, 125, 'passive')
+			eventSocket().emit(
+				'message',
+				withCorrection(makeSyncBuffer({ flags: 0x0000, tsSecondsLow: 1_700_000_000 }), correction),
+				rinfo,
+			)
+			await new Promise<void>((r) => setImmediate(r))
+			const time = client.ptp_time_n
+			client.destroy()
+			return time
+		}
+		const none = await timeFor(0)
+		const corrected = await timeFor(5_000_000)
+		const shift = corrected - none
+		expect(shift).toBeGreaterThan(4_500_000n)
+		expect(shift).toBeLessThan(5_500_000n)
+	})
+
+	it('reports no mean path delay, because it never measured one', async () => {
+		const client = await makeClient('0.0.0.0', 0, 125, 'passive')
+		eventSocket().emit('message', makeSyncBuffer({ flags: 0x0000, tsSecondsLow: 1_700_000_000 }), rinfo)
+		await new Promise<void>((r) => setImmediate(r))
+		expect(client.mean_path_delay).toBe(0n)
+		expect(client.peer_responding).toBe(false)
+		client.destroy()
+	})
+})
+
+describe('delay mechanism – peer to peer', () => {
+	/** Sync, then let the Pdelay_Req the client sends in response go out */
+	const syncAndRequest = async (domain = 0) => {
+		eventSocket().emit('message', makeSyncBuffer({ domain, flags: 0x0000, tsSecondsLow: 1_700_000_000 }), rinfo)
+		await new Promise<void>((r) => setImmediate(r))
+		await new Promise<void>((r) => setImmediate(r))
+	}
+
+	/** The sequence number of the Pdelay_Req the client last put on the wire */
+	const sentSeq = (nth = 0) => eventSocket().send.mock.calls[nth][0].readUInt16BE(30)
+
+	it('sends a Pdelay_Req to the link-local group, never a Delay_Req to the master', async () => {
+		const client = await makeClient('0.0.0.0', 0, 125, 'p2p')
+		await syncAndRequest()
+
+		expect(eventSocket().send).toHaveBeenCalledTimes(1)
+		const [buf, port, addr] = eventSocket().send.mock.calls[0]
+		expect(addr).toBe('224.0.0.107')
+		expect(port).toBe(319)
+		expect(buf.readUInt8(0) & 0x0f).toBe(0x02) // Pdelay_Req
+		client.destroy()
+	})
+
+	it('builds a conformant Pdelay_Req', async () => {
+		const client = await makeClient('0.0.0.0', 1, 125, 'p2p')
+		await syncAndRequest(1)
+
+		const buf = eventSocket().send.mock.calls[0][0]
+		expect(buf.length).toBe(54)
+		expect(buf.readUInt16BE(2)).toBe(54) // messageLength
+		expect(buf.readUInt8(4)).toBe(1) // domain
+		expect(buf.readUInt8(32)).toBe(0x05) // controlField: all others
+		expect(buf.readUInt8(33)).toBe(0x7f) // logMessageInterval: not periodic
+		// without our own portIdentity the neighbour's reply could not be told from anyone else's
+		expect(buf.toString('hex', 20, 28)).toBe(client.clock_identity)
+		client.destroy()
+	})
+
+	it('syncs from the Sync without waiting for the peer to answer', async () => {
+		// A neighbour that is not a peer delay responder must degrade to the passive
+		// calculation rather than never syncing at all
+		const client = await makeClient('0.0.0.0', 0, 125, 'p2p')
+		await syncAndRequest()
+		expect(client.is_synced).toBe(true)
+		expect(client.peer_responding).toBe(false)
+		client.destroy()
+	})
+
+	it('ignores a Pdelay_Resp addressed to a different client', async () => {
+		const client = await makeClient('0.0.0.0', 0, 125, 'p2p')
+		await syncAndRequest()
+		eventSocket().emit(
+			'message',
+			makePdelayRespBuffer({ clock_identity: 'ffeeddccbbaa9988' }, { sequence: sentSeq(), flags: 0x0000 }),
+			rinfo,
+		)
+		expect(client.peer_responding).toBe(false)
+		client.destroy()
+	})
+
+	it('ignores a Pdelay_Resp carrying a stale sequence number', async () => {
+		const client = await makeClient('0.0.0.0', 0, 125, 'p2p')
+		await syncAndRequest()
+		eventSocket().emit('message', makePdelayRespBuffer(client, { sequence: sentSeq() + 99, flags: 0x0000 }), rinfo)
+		expect(client.peer_responding).toBe(false)
+		client.destroy()
+	})
+
+	it('ignores a Follow_Up that arrives without a preceding two-step Pdelay_Resp', async () => {
+		const client = await makeClient('0.0.0.0', 0, 125, 'p2p')
+		await syncAndRequest()
+		generalSocket().emit('message', makePdelayFollowUpBuffer(client, { sequence: sentSeq() }), rinfo)
+		expect(client.peer_responding).toBe(false)
+		client.destroy()
+	})
+})
+
+// ===========================================================================
+// Peer delay arithmetic
+// ===========================================================================
+// meanLinkDelay = [(t4 − t1) − (t3 − t2) − corrections] / 2. Two of those four terms are
+// this client's own clock, so with hrtime faked the whole measurement becomes exact and the
+// formula can be asserted outright rather than bounded.
+describe('delay mechanism – peer delay measurement', () => {
+	beforeEach(() => {
+		vi.useFakeTimers({
+			toFake: ['setTimeout', 'clearTimeout', 'setInterval', 'clearInterval', 'setImmediate', 'Date', 'hrtime'],
+		})
+	})
+	afterEach(() => {
+		vi.useRealTimers()
+	})
+
+	const startP2p = async () => {
+		const client = new PTPv2Client('0.0.0.0', 0, 125, 'p2p')
+		await vi.advanceTimersByTimeAsync(0) // bind → listening
+		return client
+	}
+
+	/**
+	 * One exchange with every timing under the test's control: `wireMs` is the round trip the
+	 * fake clock is advanced by, `turnaroundNs` is what the neighbour claims it spent holding
+	 * the request, and `correctionNs` is what the transparent clocks claim on top.
+	 */
+	const exchange = async (
+		client: Awaited<ReturnType<typeof startP2p>>,
+		{
+			wireMs,
+			turnaroundNs = 0,
+			twoStep = true,
+			correctionNs = 0,
+		}: { wireMs: number; turnaroundNs?: number; twoStep?: boolean; correctionNs?: number },
+	) => {
+		const before = eventSocket().send.mock.calls.length
+		eventSocket().emit('message', makeSyncBuffer({ flags: 0x0000, tsSecondsLow: 1_700_000_000 }), rinfo)
+		await vi.advanceTimersByTimeAsync(0) // setImmediate → Pdelay_Req sent, t1 captured
+		const call = eventSocket().send.mock.calls[before]
+		expect(call).toBeDefined()
+		const seq = call[0].readUInt16BE(30)
+
+		await vi.advanceTimersByTimeAsync(wireMs) // the round trip
+
+		if (twoStep) {
+			// t2 = 1s exactly; t3 = 1s + turnaround. Only the difference is ever used.
+			eventSocket().emit(
+				'message',
+				makePdelayRespBuffer(client, { sequence: seq, flags: 0x0200, tsSecondsLow: 1, tsNanoseconds: 0 }),
+				rinfo,
+			)
+			generalSocket().emit(
+				'message',
+				withCorrection(
+					makePdelayFollowUpBuffer(client, { sequence: seq, tsSecondsLow: 1, tsNanoseconds: turnaroundNs }),
+					correctionNs,
+				),
+				rinfo,
+			)
+			return
+		}
+		// One step: zeroed timestamps, turnaround folded into the correction field
+		eventSocket().emit(
+			'message',
+			withCorrection(makePdelayRespBuffer(client, { sequence: seq, flags: 0x0000 }), correctionNs),
+			rinfo,
+		)
+	}
+
+	it('halves the round trip when the neighbour turns the request around instantly', async () => {
+		const client = await startP2p()
+		await exchange(client, { wireMs: 10, turnaroundNs: 0 })
+		expect(client.peer_responding).toBe(true)
+		expect(client.peer_mean_path_delay).toBe(5_000_000n) // 10ms / 2
+		client.destroy()
+	})
+
+	it('subtracts the neighbour turnaround before halving, in a two-step exchange', async () => {
+		const client = await startP2p()
+		await exchange(client, { wireMs: 10, turnaroundNs: 4_000_000 })
+		expect(client.peer_mean_path_delay).toBe(3_000_000n) // (10ms − 4ms) / 2
+		client.destroy()
+	})
+
+	it('takes the turnaround from the correction field in a one-step exchange', async () => {
+		const client = await startP2p()
+		await exchange(client, { wireMs: 10, twoStep: false, correctionNs: 4_000_000 })
+		// The same link, measured the other way the standard allows, must come out the same
+		expect(client.peer_mean_path_delay).toBe(3_000_000n)
+		client.destroy()
+	})
+
+	it('subtracts transparent clock residence on top of the turnaround', async () => {
+		const client = await startP2p()
+		await exchange(client, { wireMs: 10, turnaroundNs: 2_000_000, correctionNs: 2_000_000 })
+		expect(client.peer_mean_path_delay).toBe(3_000_000n) // (10ms − 2ms − 2ms) / 2
+		client.destroy()
+	})
+
+	it('rejects a negative result rather than poisoning the offset', async () => {
+		const client = await startP2p()
+		// A neighbour claiming it held the request longer than the whole round trip took
+		await exchange(client, { wireMs: 2, turnaroundNs: 50_000_000 })
+		expect(client.peer_mean_path_delay).toBe(0n)
+		expect(client.peer_responding).toBe(false)
+		client.destroy()
+	})
+
+	it('rejects an implausibly distant peer — no single link is 100ms away', async () => {
+		const client = await startP2p()
+		await exchange(client, { wireMs: 300, turnaroundNs: 0 }) // would be a 150ms link
+		expect(client.peer_mean_path_delay).toBe(0n)
+		expect(client.peer_responding).toBe(false)
+		client.destroy()
+	})
+
+	it('emits peer_delay_changed once, and not again while the link is unchanged', async () => {
+		const client = await startP2p()
+		const changed = vi.fn()
+		client.on('peer_delay_changed', changed)
+
+		await exchange(client, { wireMs: 10, turnaroundNs: 0 })
+		expect(changed).toHaveBeenCalledTimes(1)
+		expect(changed).toHaveBeenCalledWith(5_000_000n)
+
+		await vi.advanceTimersByTimeAsync(200) // clear the sync interval
+		await exchange(client, { wireMs: 10, turnaroundNs: 0 }) // identical link
+		expect(changed).toHaveBeenCalledTimes(1)
+
+		await vi.advanceTimersByTimeAsync(200)
+		await exchange(client, { wireMs: 20, turnaroundNs: 0 }) // the link changed
+		expect(changed).toHaveBeenCalledTimes(2)
+		expect(changed).toHaveBeenLastCalledWith(10_000_000n)
+		client.destroy()
+	})
+
+	it('the measured link delay is added into the reported time', async () => {
+		// The whole reason to measure it. A Sync that spent 5ms on the wire left the master
+		// when its clock read t1, but by the time it reached us that clock said t1 + 5ms.
+		// Ignoring the link therefore leaves our time behind by exactly one link delay.
+		const timeWith = async (respond: boolean): Promise<bigint> => {
+			mockSockets = []
+			const client = await startP2p()
+			if (respond) {
+				await exchange(client, { wireMs: 10, turnaroundNs: 0 }) // 5ms link
+				await vi.advanceTimersByTimeAsync(200)
+			}
+			// A second Sync, now that peerMeanPathDelay is known, is the one that uses it
+			eventSocket().emit('message', makeSyncBuffer({ flags: 0x0000, tsSecondsLow: 1_700_000_000 }), rinfo)
+			await vi.advanceTimersByTimeAsync(0)
+			const time = client.ptp_time_n
+			client.destroy()
+			return time
+		}
+		const withoutPeer = await timeWith(false)
+		const withPeer = await timeWith(true)
+		expect(withPeer - withoutPeer).toBe(5_000_000n)
+	})
+})
+
+describe('delay mechanism – labels', () => {
+	it.each([
+		['e2e', 'End to End'],
+		['p2p', 'Peer to Peer'],
+		['passive', 'Passive'],
+	] as const)('%s renders as %s', async (mechanism, label) => {
+		const client = await makeClient('0.0.0.0', 0, 125, mechanism)
+		expect(client.delay_mechanism_label).toBe(label)
+		client.destroy()
+	})
+
+	it('reads as Detecting until auto has settled', async () => {
+		const client = await makeClient('0.0.0.0', 0, 125, 'auto')
+		expect(client.delay_mechanism_label).toBe('Detecting')
+		client.destroy()
 	})
 })

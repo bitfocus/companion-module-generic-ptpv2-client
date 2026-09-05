@@ -14,26 +14,54 @@ The two are wire-compatible for everything this module reads. 2019 redefines sev
 
 ## Requirements
 
-The module joins the PTP multicast group and binds to UDP ports **319** (event) and **320** (general). Both are privileged ports, so on Linux the Node.js binary needs permission to bind them — grant `CAP_NET_BIND_SERVICE` with `setcap`, use `authbind`, or redirect the ports with `iptables`.
+The module joins the PTP multicast group 224.0.1.129 and binds to UDP ports **319** (event) and **320** (general). Unless the delay mechanism is set to End to End it also joins the peer delay group 224.0.0.107. Both are privileged ports, so on Linux the Node.js binary needs permission to bind them — grant `CAP_NET_BIND_SERVICE` with `setcap`, use `authbind`, or redirect the ports with `iptables`.
 
 ## Configuration
 
 | Setting            | Description                                                                                                                                                                                 |
 | ------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Interface          | The local IPv4 interface to monitor. This selects which interface joins the multicast group; the sockets themselves bind to all interfaces, which is required to receive multicast traffic. |
-| Domain             | PTP domain to monitor, 0–127. Domains 0–3 use their own multicast addresses (224.0.1.129–132); domains 4–127 all share 224.0.1.129 and are separated by the domain byte in the packet.      |
-| Sync Interval (ms) | How often this module issues a Delay Request, 125–30000 ms. This is a rate limit on **our own** traffic, not a property of the master, and it does not affect how sync loss is detected.    |
+| Domain             | PTP domain to monitor, 0–127. Every domain shares the multicast address 224.0.1.129 and is separated by the domain byte in the packet.                                                      |
+| Sync Interval (ms) | How often this module takes a measurement, 125–30000 ms. This is a rate limit on **our own** traffic, not a property of the master, and it does not affect how sync loss is detected.       |
+| Delay Mechanism    | How path delay is established: `Auto`, `End to End`, `Peer to Peer`, or `Passive`. See below.                                                                                               |
+
+## Delay mechanism
+
+A Sync message tells you when the master sent it, not when it arrived. Turning that into an offset requires knowing how long it spent on the wire, and PTP defines two entirely different ways of finding out. **The two must not be mixed on one path**, which is why this is a setting rather than something the module simply does.
+
+| Mechanism        | What it does                                                                                                                                                                                             |
+| ---------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **End to End**   | Exchanges Delay_Req/Delay_Resp with the master to measure the whole path. The IEEE 1588 default, and what **SMPTE ST 2059-2** and **AES67** require.                                                     |
+| **Peer to Peer** | Measures only the link to the directly attached switch with a Pdelay exchange; the rest of the path arrives already summed in the `correctionField`. Required by **IEEE 802.1AS / gPTP**, AVB and Milan. |
+| **Passive**      | Transmits nothing whatsoever. Takes the path from the `correctionField` and treats the local link as free.                                                                                               |
+| **Auto**         | Listens first, then settles on Peer to Peer or End to End. The default.                                                                                                                                  |
+
+The mechanism actually in use is reported by `$(ptp:delayMechanism)` and logged when it is decided.
+
+### Choosing one
+
+If you know what the network runs — from its profile, or from the grandmaster's own configuration — set it explicitly. Otherwise leave it on **Auto**.
+
+**Auto** transmits nothing until it has decided. Peer delay traffic on the domain is conclusive proof of a Peer to Peer network, so hearing any settles the question immediately; hearing none for four seconds is taken as End to End.
+
+That inference is deliberately one-sided, and it is worth understanding why. Peer delay is **link-local** — sent to 224.0.0.107, which no router forwards — so the only device whose peer delay you can ever hear is the one on the other end of your own cable. On a Peer to Peer network where the switch port you are plugged into is not itself a peer delay responder, there is nothing to hear, and Auto will wrongly settle on End to End. **If a Peer to Peer network reports no PTP time, set the mechanism to Peer to Peer or Passive explicitly.**
+
+### Peer to Peer without a responding neighbour
+
+A neighbour that does not answer `Pdelay_Req` is not a failure. The module still syncs, using the `correctionField` exactly as Passive does, and simply leaves the local link unaccounted for — the reported time is then behind by one link delay, normally well under a microsecond on copper. `$(ptp:peerDelayResponding)` reports whether the neighbour is answering, and the condition is logged once as a warning.
+
+Note that `$(ptp:peerMeanPathDelay)` is the delay of **your own link only**, not the distance to the grandmaster. In a Peer to Peer network there is no single figure for the latter — that is precisely what the `correctionField` accumulates on the way.
 
 ## How synchronisation is measured
 
-The module runs the standard delay request/response exchange and derives two figures from the four timestamps:
+From the timestamps of an exchange the module derives:
 
 - **Offset** — how far the local clock is from the master, used to produce the PTP Time variables.
-- **Mean path delay** — the average network transit time to the master.
+- **Mean path delay** — the network transit time to the master. **End to End only**; the other mechanisms never measure it and leave the variable empty rather than reporting a zero that would read as a perfect path.
 
-The `correctionField` of every Sync, Follow_Up and Delay_Response is applied, so residence time accumulated by transparent clocks (most PTP-aware switches) is accounted for rather than appearing as offset error.
+The `correctionField` of every Sync, Follow_Up and Delay_Response is applied, so residence time accumulated by transparent clocks (most PTP-aware switches) is accounted for rather than appearing as offset error. In a Peer to Peer network that same field is where the entire path delay arrives.
 
-Each Delay Response is matched against this client's own clock identity, so responses addressed to other slaves on the network are ignored.
+Each Delay Response and Pdelay Response is matched against this client's own clock identity, so responses addressed to other slaves on the network are ignored. A peer delay measurement that comes out negative, or larger than 100 ms, is discarded rather than folded into the offset.
 
 ## Loss of sync
 
@@ -77,12 +105,12 @@ A clock identity appearing twice in the chain means the Announce travelled a loo
 
 | Feedback                           | Description                                                                                                                      |
 | ---------------------------------- | -------------------------------------------------------------------------------------------------------------------------------- |
-| PTP Synced                         | True while a delay exchange has completed and Sync messages are still arriving.                                                  |
+| PTP Synced                         | True while a measurement has completed and Sync messages are still arriving.                                                     |
 | Time Traceable                     | True while the grandmaster reports its time as traceable to a primary reference.                                                 |
 | Leap Second Pending                | True when the grandmaster announces a leap second at the end of the current UTC day.                                             |
 | Grandmaster Clock Class Worse Than | True when the grandmaster clock class exceeds the configured threshold. Lower is better.                                         |
 | Steps Removed Above                | True when there are more boundary clocks between this host and the grandmaster than the threshold.                               |
-| Mean Path Delay Above              | True when the measured mean path delay exceeds the threshold, in nanoseconds.                                                    |
+| Mean Path Delay Above              | True when the measured mean path delay exceeds the threshold, in nanoseconds. End to End only.                                   |
 | Path Trace Loop Detected           | True when a clock identity appears more than once in the PATH_TRACE of an Announce. Requires the grandmaster to emit path trace. |
 
 ## Variables
@@ -91,21 +119,24 @@ Variables are referenced as `$(instance-label:variable)`, where the label is wha
 
 ### Time
 
-| Variable           | Description                                               |
-| ------------------ | --------------------------------------------------------- |
-| `$(ptp:ptpTime)`   | PTP time in nanoseconds.                                  |
-| `$(ptp:ptpTimeS)`  | PTP time, whole seconds.                                  |
-| `$(ptp:ptpTimeNS)` | PTP time, nanoseconds within the current second.          |
-| `$(ptp:lastSync)`  | Timestamp of the last completed delay exchange, ISO 8601. |
+| Variable           | Description                                            |
+| ------------------ | ------------------------------------------------------ |
+| `$(ptp:ptpTime)`   | PTP time in nanoseconds.                               |
+| `$(ptp:ptpTimeS)`  | PTP time, whole seconds.                               |
+| `$(ptp:ptpTimeNS)` | PTP time, nanoseconds within the current second.       |
+| `$(ptp:lastSync)`  | Timestamp of the last completed measurement, ISO 8601. |
 
 The PTP Time variables are a snapshot taken at each sync event, not a live clock.
 
 ### Measurement quality
 
-| Variable                | Description                                                                                                                                                                                                                                  |
-| ----------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `$(ptp:meanPathDelay)`  | Mean path delay to the master, in nanoseconds. A rising value indicates a congested or asymmetric path.                                                                                                                                      |
-| `$(ptp:lastCorrection)` | How far the clock had drifted when the last exchange completed, in nanoseconds. Consistently large values indicate an unstable measurement. Reported as `0` for the first exchange, which carries the initial acquisition rather than drift. |
+| Variable                     | Description                                                                                                                                                                                                                                  |
+| ---------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `$(ptp:meanPathDelay)`       | Mean path delay to the master, in nanoseconds. A rising value indicates a congested or asymmetric path.                                                                                                                                      |
+| `$(ptp:lastCorrection)`      | How far the clock had drifted when the last exchange completed, in nanoseconds. Consistently large values indicate an unstable measurement. Reported as `0` for the first exchange, which carries the initial acquisition rather than drift. |
+| `$(ptp:delayMechanism)`      | The delay mechanism in use: `End to End`, `Peer to Peer`, `Passive`, or `Detecting` while Auto is still listening.                                                                                                                           |
+| `$(ptp:peerMeanPathDelay)`   | Measured delay of the link to the directly attached neighbour, in nanoseconds. Peer to Peer only, and empty until the neighbour answers. This is one link, not the distance to the grandmaster.                                              |
+| `$(ptp:peerDelayResponding)` | Whether the attached neighbour is answering `Pdelay_Req`. False in a Peer to Peer network means the reported time excludes the local link delay.                                                                                             |
 
 ### Master
 

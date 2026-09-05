@@ -21,6 +21,8 @@ export default class ModuleInstance extends InstanceBase<ModuleSchema> {
 	config!: ModuleConfig // Setup in init()
 	client: PTPv2Client | undefined
 	statusManager = new StatusManager(this)
+	/** P2P with an unresponsive neighbour is worth saying once, not on every sync */
+	private warnedNoPeerDelay = false
 
 	constructor(internal: unknown) {
 		super(internal)
@@ -47,10 +49,14 @@ export default class ModuleInstance extends InstanceBase<ModuleSchema> {
 
 		this.client?.destroy()
 		this.client = undefined
+		this.warnedNoPeerDelay = false
 
 		if (config.interface) {
 			try {
-				this.client = new PTPv2Client(config.interface, config.domain, config.interval)
+				// The upgrade script pins pre-existing connections to 'e2e' and the config field
+				// defaults new ones to 'auto', so this only guards against a config that reached
+				// us without going through either
+				this.client = new PTPv2Client(config.interface, config.domain, config.interval, config.delayMechanism ?? 'auto')
 				this.listenForClientEvents()
 				this.getVarValues()
 				this.statusManager.updateStatus(InstanceStatus.Ok)
@@ -88,6 +94,25 @@ export default class ModuleInstance extends InstanceBase<ModuleSchema> {
 				...this.measurementValues(),
 			})
 			this.statusManager.updateStatus(InstanceStatus.Ok)
+			this.checkPeerDelay()
+		})
+		this.client.on('delay_mechanism_changed', (mechanism, detected) => {
+			const label = this.client?.delay_mechanism_label ?? mechanism
+			this.log(
+				'info',
+				detected
+					? `Delay mechanism detected: ${label}${mechanism === 'e2e' ? ' (no peer delay traffic seen)' : ''}`
+					: `Delay mechanism: ${label}`,
+			)
+			this.setVariableValues({ delayMechanism: label })
+			this.checkAllFeedbacks()
+		})
+		this.client.on('peer_delay_changed', (peerDelay) => {
+			this.log('debug', `Peer link delay: ${peerDelay}ns`)
+			this.setVariableValues({
+				peerMeanPathDelay: Number(peerDelay),
+				peerDelayResponding: this.client?.peer_responding ?? false,
+			})
 		})
 		this.client.on('version_changed', (version) => {
 			this.log('info', `PTP version in use: ${version}${version === '2.1' ? ' (IEEE 1588-2019)' : ' (IEEE 1588-2008)'}`)
@@ -151,13 +176,41 @@ export default class ModuleInstance extends InstanceBase<ModuleSchema> {
 		})
 	}
 
-	/** The per-exchange measurement quality figures, as plain numbers for Companion. */
+	/**
+	 * The per-exchange measurement quality figures, as plain numbers for Companion.
+	 *
+	 * Mean path delay is only ever measured by the end to end exchange. Reporting the
+	 * untouched zero of the other mechanisms as though it were a measurement would read as a
+	 * perfect path rather than as no measurement at all, so it is left undefined instead.
+	 */
 	private measurementValues(): Partial<VariablesSchema> {
 		if (!this.client || this.client.last_sync === 0) return {}
+		const mechanism = this.client.delay_mechanism
 		return {
-			meanPathDelay: Number(this.client.mean_path_delay),
+			meanPathDelay: mechanism === 'e2e' ? Number(this.client.mean_path_delay) : undefined,
+			peerMeanPathDelay:
+				mechanism === 'p2p' && this.client.peer_responding ? Number(this.client.peer_mean_path_delay) : undefined,
+			peerDelayResponding: this.client.peer_responding,
+			delayMechanism: this.client.delay_mechanism_label,
 			lastCorrection: Number(this.client.last_correction),
 		}
+	}
+
+	/**
+	 * A P2P domain whose switch port does not answer Pdelay leaves the reported time short by
+	 * one link delay. That is usually sub-microsecond and often acceptable, but it is silent,
+	 * so it gets said once.
+	 */
+	private checkPeerDelay(): void {
+		if (this.warnedNoPeerDelay) return
+		if (!this.client || this.client.delay_mechanism !== 'p2p') return
+		if (this.client.peer_responding) return
+		this.warnedNoPeerDelay = true
+		this.log(
+			'warn',
+			`Peer to peer delay requested but the attached port is not answering Pdelay_Req. ` +
+				`Reported time excludes the delay of the local link.`,
+		)
 	}
 
 	private getVarValues(): void {
@@ -176,6 +229,8 @@ export default class ModuleInstance extends InstanceBase<ModuleSchema> {
 			ptpMasterOui: this.client.ptp_master_oui,
 			ptpMasterVendor: this.client.ptp_master_vendor ?? '',
 			ptpVersion: this.client.ptp_version,
+			delayMechanism: this.client.delay_mechanism_label,
+			peerDelayResponding: this.client.peer_responding,
 			...this.measurementValues(),
 			...announceValues(this.client.grandmaster, this.client.last_announce, this.client.grandmaster_address),
 			...flagValues(this.client.ptp_flags),

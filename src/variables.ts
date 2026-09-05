@@ -11,6 +11,12 @@ export type VariablesSchema = {
 	meanPathDelay: number | undefined
 	lastCorrection: number | undefined
 
+	// Delay mechanism. peerMeanPathDelay is the local link only — in a P2P domain the rest
+	// of the path arrives already summed in the Sync correction field.
+	delayMechanism: string
+	peerMeanPathDelay: number | undefined
+	peerDelayResponding: boolean
+
 	// The port sending Sync — behind a boundary clock this is not the grandmaster
 	ptpMaster: string
 	ptpMasterAddress: string
@@ -58,6 +64,9 @@ export function UpdateVariableDefinitions(self: ModuleInstance): void {
 		lastSync: { name: 'Last Sync Timestamp' },
 
 		meanPathDelay: { name: 'Mean Path Delay (ns)' },
+		delayMechanism: { name: 'Delay Mechanism' },
+		peerMeanPathDelay: { name: 'Peer Mean Path Delay (ns)' },
+		peerDelayResponding: { name: 'Peer Delay Responding' },
 		lastCorrection: { name: 'Last Clock Correction (ns)' },
 
 		ptpMaster: { name: 'PTP Master (Clock Identity)' },

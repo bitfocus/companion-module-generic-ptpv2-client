@@ -14,6 +14,11 @@ export type PtpTime = [number, number]
 // PTPv2 replaced with domainNumber; no PTPv2 traffic is ever sent to them.
 // Domains 0–127 are valid; 128–255 are reserved by the standard.
 const PTP_PRIMARY_MULTICAST = '224.0.1.129'
+// The peer delay mechanism has its own group, and it is deliberately link-local: 224.0.0.0/24
+// is never forwarded by a router. Pdelay therefore only ever reaches the device on the other
+// end of our own cable, which is what makes it measure a link rather than a path — and also
+// why hearing no Pdelay proves nothing about the rest of the domain.
+const PTP_PDELAY_MULTICAST = '224.0.0.107'
 
 // IEEE 1588-2019 redefined the upper nibble of byte 1, reserved in 2008, as minorVersionPTP.
 // A 2019 device therefore sends 0x12 rather than 0x02, and the version check must mask the
@@ -26,8 +31,11 @@ const PTP_GENERAL_PORT = 320
 // Message types (low nibble of byte 0)
 const MSG_SYNC = 0x00
 const MSG_DELAY_REQ = 0x01
+const MSG_PDELAY_REQ = 0x02
+const MSG_PDELAY_RESP = 0x03
 const MSG_FOLLOW_UP = 0x08
 const MSG_DELAY_RESP = 0x09
+const MSG_PDELAY_RESP_FOLLOW_UP = 0x0a
 const MSG_ANNOUNCE = 0x0b
 
 // Offsets into the PTP packet
@@ -44,6 +52,11 @@ const REQUESTING_PORT_IDENTITY_OFFSET = TIMESTAMP_OFFSET + TIMESTAMP_LENGTH
 const DELAY_RESP_LENGTH = REQUESTING_PORT_IDENTITY_OFFSET + PORT_IDENTITY_LENGTH
 // A Delay_Req is header + originTimestamp; the timestamp itself is sent as zero
 const DELAY_REQ_LENGTH = TIMESTAMP_OFFSET + TIMESTAMP_LENGTH
+// Pdelay_Resp and Pdelay_Resp_Follow_Up echo the requester's portIdentity in the same place
+// a Delay_Resp does. A Pdelay_Req is padded to the same length with a reserved tail, so that
+// a responder timestamping at a fixed offset sees a conformant message.
+const PDELAY_RESP_LENGTH = REQUESTING_PORT_IDENTITY_OFFSET + PORT_IDENTITY_LENGTH
+const PDELAY_REQ_LENGTH = PDELAY_RESP_LENGTH
 
 // Announce body, after the 34-byte header and its 10-byte originTimestamp
 const ANNOUNCE_UTC_OFFSET = 44
@@ -67,6 +80,15 @@ const TLV_PATH_TRACE = 0x0008
 const CLOCK_IDENTITY_LENGTH = 8
 
 const NS_PER_S = 1_000_000_000n
+
+// How long auto-detection listens before concluding the domain is E2E. Peer delay defaults to
+// one exchange per second, so this covers several opportunities to hear one while keeping the
+// wait before the first measurement short.
+const AUTO_DETECT_WINDOW_MS = 4000
+// A single link cannot plausibly be this far away — 100ms is some 20,000km of fibre. A peer
+// answering with anything larger is malfunctioning, and folding that into the offset would do
+// far more damage than ignoring the link delay altogether.
+const MAX_PEER_DELAY_NS = 100_000_000n
 
 // IEEE 1588-2008 §7.7.3.1: a receipt timeout is a whole multiple of the interval the master
 // advertises for that message, not a fixed wall-clock duration. announceReceiptTimeout
@@ -383,6 +405,23 @@ const readAnnounce = (buffer: Buffer): PtpAnnounce | undefined => {
 	}
 }
 
+/**
+ * How the client establishes the delay between itself and the source of time.
+ *
+ * - `e2e`     Delay_Req/Delay_Resp with the master. The IEEE 1588 default, and what SMPTE
+ *             ST 2059-2 and AES67 mandate.
+ * - `p2p`     Pdelay exchange with the immediately attached neighbour, with the rest of the
+ *             path taken from the Sync correctionField. Mandated by IEEE 802.1AS (gPTP).
+ * - `passive` Transmit nothing at all; take the path from the correctionField and treat the
+ *             local link as free. Correct to within one link delay in a P2P domain, and the
+ *             only mode that is guaranteed not to put a single packet on the network.
+ * - `auto`    Listen for peer delay traffic, then settle on `p2p` or `e2e`.
+ */
+export type DelayMechanism = 'auto' | 'e2e' | 'p2p' | 'passive'
+
+/** What `auto` is allowed to settle on — every mechanism that actually defines behaviour. */
+export type ResolvedDelayMechanism = Exclude<DelayMechanism, 'auto'>
+
 export interface PTPv2ClientEvents {
 	close: [msg: string]
 	error: [err: Error]
@@ -396,6 +435,8 @@ export interface PTPv2ClientEvents {
 	sync_changed: [sync: boolean]
 	master_lost: [reason: string]
 	version_changed: [version: string]
+	delay_mechanism_changed: [mechanism: ResolvedDelayMechanism, detected: boolean]
+	peer_delay_changed: [peerMeanPathDelay: bigint]
 }
 
 /**
@@ -420,6 +461,12 @@ export class PTPv2Client extends EventEmitter<PTPv2ClientEvents> {
 	private minSyncInterval: number = 10000
 	private domainsFound: Set<number> = new Set<number>()
 	private destroyed: boolean = false
+
+	//delay mechanism — what was configured, and what the client is actually doing
+	private delayMechanism: DelayMechanism = 'auto'
+	private resolvedMechanism: ResolvedDelayMechanism | undefined = undefined
+	private detectTimeout: NodeJS.Timeout | undefined = undefined
+	private pdelaySeen: boolean = false
 
 	// Our portIdentity: 8-byte clockIdentity + 2-byte portNumber. Sent in every Delay_Req and
 	// compared against the requestingPortIdentity echoed back in Delay_Resp.
@@ -449,6 +496,18 @@ export class PTPv2Client extends EventEmitter<PTPv2ClientEvents> {
 	private lastSync: number = 0
 	private lastRequest: number = 0
 
+	//peer delay — pt1/pt4 are local, pt2/pt3 come from the neighbour. Every term of the
+	//measurement is a difference within one clock, so the two timebases never have to agree.
+	private pt1: bigint = 0n // Pdelay_Req transmit time here
+	private pt2: bigint = 0n // Pdelay_Req receive time at the neighbour
+	private pt3: bigint = 0n // Pdelay_Resp transmit time at the neighbour
+	private pt4: bigint = 0n // Pdelay_Resp receive time here
+	private pdelayCorrection: bigint = 0n // accumulated correctionField of the response pair
+	private peerMeanPathDelay: bigint = 0n
+	private pdelay_seq: number = 0
+	private awaitingPdelayFollowUp: boolean = false
+	private peerResponding: boolean = false
+
 	/**
 	 * Initialise the client
 	 *
@@ -456,9 +515,16 @@ export class PTPv2Client extends EventEmitter<PTPv2ClientEvents> {
 	 * @param domain PTP domain to listen to (0–127; every domain shares the 224.0.1.129
 	 *               multicast group and is distinguished by the header's domainNumber)
 	 * @param interval Minimum PTP sync interval (125ms)
+	 * @param delayMechanism How to establish path delay: 'e2e', 'p2p', 'passive', or 'auto'
+	 *                       to detect between P2P and E2E by listening first (default)
 	 */
 
-	constructor(iface: string = '0.0.0.0', domain: number = 0, interval: number = 10000) {
+	constructor(
+		iface: string = '0.0.0.0',
+		domain: number = 0,
+		interval: number = 10000,
+		delayMechanism: DelayMechanism = 'auto',
+	) {
 		super()
 		if (!isIPv4(iface)) {
 			throw new TypeError(
@@ -468,6 +534,21 @@ export class PTPv2Client extends EventEmitter<PTPv2ClientEvents> {
 		this.addr = iface
 		if (domain >= 0 && domain <= 127) this.ptp_domain = Math.round(domain)
 		if (interval >= 125) this.minSyncInterval = Math.round(interval)
+		this.delayMechanism = delayMechanism
+
+		if (delayMechanism === 'auto') {
+			// Observe before transmitting. Sending Delay_Req into a P2P domain is traffic the
+			// standard forbids mixing onto one path, so auto mode stays silent until it has
+			// either heard peer delay or waited long enough to conclude there is none.
+			this.detectTimeout = setTimeout(() => {
+				this.detectTimeout = undefined
+				this.resolveMechanism('e2e', true)
+			}, AUTO_DETECT_WINDOW_MS)
+			// A detection timer must never be the reason a process stays alive
+			this.detectTimeout.unref?.()
+		} else {
+			this.resolvedMechanism = delayMechanism
+		}
 
 		this.portIdentity = Buffer.alloc(PORT_IDENTITY_LENGTH)
 		clockIdentityForAddress(this.addr).copy(this.portIdentity, 0)
@@ -519,6 +600,15 @@ export class PTPv2Client extends EventEmitter<PTPv2ClientEvents> {
 			if (domain != this.ptp_domain) return
 			this.updateMinorVersion(versionByte >> 4)
 
+			// Peer delay traffic is the one positive indicator that this domain runs P2P:
+			// Pdelay_Req is what a neighbour transmits unprompted, Pdelay_Resp is its answer
+			// to us. Both are event messages and so arrive here rather than on port 320.
+			if (type == MSG_PDELAY_REQ || type == MSG_PDELAY_RESP) {
+				this.notePdelaySeen()
+				if (type == MSG_PDELAY_RESP) this.handlePdelayResp(buffer, recv_ts, flags)
+				return
+			}
+
 			if (type != MSG_SYNC)
 				//only process sync messages
 				return
@@ -558,7 +648,7 @@ export class PTPv2Client extends EventEmitter<PTPv2ClientEvents> {
 				this.syncCorrection = 0n
 				this.t1 = readPtpTimestamp(buffer) + readCorrectionField(buffer)
 
-				this.sendDelayReq()
+				this.completeSyncMeasurement()
 			}
 		})
 
@@ -579,6 +669,13 @@ export class PTPv2Client extends EventEmitter<PTPv2ClientEvents> {
 			if (domain != this.ptp_domain) return
 			this.updateMinorVersion(versionByte >> 4)
 
+			// The only general-message half of the peer delay exchange
+			if (type == MSG_PDELAY_RESP_FOLLOW_UP) {
+				this.notePdelaySeen()
+				this.handlePdelayRespFollowUp(buffer, sequence)
+				return
+			}
+
 			if (type == MSG_ANNOUNCE) {
 				if (buffer.length < ANNOUNCE_LENGTH) return
 				this.updateFlags(buffer.readUInt16BE(6), true)
@@ -592,8 +689,8 @@ export class PTPv2Client extends EventEmitter<PTPv2ClientEvents> {
 				//follow up msg with current seq
 				this.t1 = readPtpTimestamp(buffer) + this.syncCorrection + readCorrectionField(buffer)
 
-				this.sendDelayReq()
-			} else if (type == MSG_DELAY_RESP && this.req_seq == sequence && this.isOurDelayResp(buffer)) {
+				this.completeSyncMeasurement()
+			} else if (type == MSG_DELAY_RESP && this.req_seq == sequence && this.isOurResponse(buffer)) {
 				//delay_rsp msg
 				this.ts2 = readPtpTimestamp(buffer) - readCorrectionField(buffer)
 
@@ -636,6 +733,10 @@ export class PTPv2Client extends EventEmitter<PTPv2ClientEvents> {
 	private joinMulticast(socket: dgram.Socket): void {
 		try {
 			socket.addMembership(PTP_PRIMARY_MULTICAST, this.addr)
+			// Joined for every mechanism that could care about peer delay: p2p needs it to hear
+			// its own responses, auto needs it to detect at all, and passive uses it to report
+			// what the domain is really running. Only an explicit e2e has no use for it.
+			if (this.delayMechanism !== 'e2e') socket.addMembership(PTP_PDELAY_MULTICAST, this.addr)
 		} catch (e) {
 			this.emit('error', e instanceof Error ? e : new Error(String(e)))
 		}
@@ -655,13 +756,164 @@ export class PTPv2Client extends EventEmitter<PTPv2ClientEvents> {
 		return Date.now() - this.lastRequest > this.minSyncInterval
 	}
 
-	/** Is this Delay_Resp answering our request, rather than another slave's? */
-	private isOurDelayResp(buffer: Buffer): boolean {
+	/**
+	 * Is this response answering our request, rather than another slave's? Delay_Resp,
+	 * Pdelay_Resp and Pdelay_Resp_Follow_Up all echo the requester's portIdentity in the
+	 * same place, so one check serves all three.
+	 */
+	private isOurResponse(buffer: Buffer): boolean {
 		if (buffer.length < DELAY_RESP_LENGTH) return false
 		return (
 			buffer.compare(this.portIdentity, 0, PORT_IDENTITY_LENGTH, REQUESTING_PORT_IDENTITY_OFFSET, DELAY_RESP_LENGTH) ===
 			0
 		)
+	}
+
+	/**
+	 * A Sync — and its Follow_Up, if the master is two-step — has yielded t1. What happens
+	 * next is the whole of the difference between the mechanisms: E2E asks the master to
+	 * measure the path, P2P applies the correction it already holds and refreshes its link
+	 * measurement, passive applies the correction and transmits nothing at all.
+	 *
+	 * While auto-detection is still undecided nothing is sent. Probing with the wrong
+	 * mechanism is precisely what auto mode exists to avoid.
+	 */
+	private completeSyncMeasurement(): void {
+		switch (this.resolvedMechanism) {
+			case 'e2e':
+				this.sendDelayReq()
+				break
+			case 'p2p':
+				this.applySyncOffset()
+				this.sendPdelayReq()
+				break
+			case 'passive':
+				this.applySyncOffset()
+				break
+			default:
+				break //still detecting — observe only
+		}
+	}
+
+	/**
+	 * Offset from the Sync alone, for the mechanisms that do not ask the master to measure
+	 * the path.
+	 *
+	 * t1 already carries the correctionField, which in a P2P domain is where the transparent
+	 * clocks along the way have accumulated their residence and link times. What that leaves
+	 * unaccounted for is the delay of our own cable to the neighbour, which is exactly what
+	 * peerMeanPathDelay holds — zero in passive mode, and zero in P2P until the first Pdelay
+	 * exchange completes. A Sync that spent time on the wire left the master when its clock
+	 * read t1 but arrived when it read t1 plus that delay, so treating the link as free
+	 * leaves the reported time behind by exactly one link delay.
+	 */
+	private applySyncOffset(): void {
+		this.lastRequest = Date.now()
+		const correction = this.ts1 - this.t1 - this.peerMeanPathDelay
+		// As in the E2E path: the first measurement carries the whole gap between the local
+		// timebase and the PTP epoch, which is acquisition rather than drift
+		this.lastCorrection = this.hasSynced ? correction : 0n
+		this.hasSynced = true
+		this.offset += correction
+
+		this.lastSync = Date.now()
+		this.emit('ptp_time_synced', this.ptp_time, this.lastSync)
+		this.sync_change(true)
+	}
+
+	/**
+	 * Peer delay traffic seen. Positive detection is conclusive and immediate — nothing but
+	 * a P2P domain puts these messages on the wire — so auto mode settles here rather than
+	 * waiting out the rest of its window.
+	 */
+	private notePdelaySeen(): void {
+		this.pdelaySeen = true
+		if (this.delayMechanism === 'auto' && this.resolvedMechanism === undefined) {
+			this.resolveMechanism('p2p', true)
+		}
+	}
+
+	/** Settle on a mechanism and stop detecting. */
+	private resolveMechanism(mechanism: ResolvedDelayMechanism, detected: boolean): void {
+		if (this.detectTimeout) clearTimeout(this.detectTimeout)
+		this.detectTimeout = undefined
+		if (this.resolvedMechanism === mechanism) return
+		this.resolvedMechanism = mechanism
+		this.emit('delay_mechanism_changed', mechanism, detected)
+	}
+
+	/**
+	 * Pdelay_Resp: the neighbour's answer, carrying t2 and — when it is a two-step responder
+	 * — a promise of t3 in the Follow_Up to come.
+	 */
+	private handlePdelayResp(buffer: Buffer, recv_ts: bigint, flags: number): void {
+		if (buffer.length < PDELAY_RESP_LENGTH) return
+		if (this.pdelay_seq != buffer.readUInt16BE(SEQUENCE_OFFSET)) return
+		if (!this.isOurResponse(buffer)) return
+
+		this.pt4 = recv_ts
+		this.pdelayCorrection = readCorrectionField(buffer)
+
+		if ((flags & 0x0200) == 0x0200) {
+			//two step: t2 is here, t3 follows in the Pdelay_Resp_Follow_Up
+			this.pt2 = readPtpTimestamp(buffer)
+			this.awaitingPdelayFollowUp = true
+			return
+		}
+		// One step: the responder folded its own turnaround into the correctionField and sent
+		// zeroed timestamps, so there is no t3 − t2 left to subtract separately.
+		this.awaitingPdelayFollowUp = false
+		this.completePdelay(0n)
+	}
+
+	/** Pdelay_Resp_Follow_Up: t3, completing a two-step exchange. */
+	private handlePdelayRespFollowUp(buffer: Buffer, sequence: number): void {
+		if (!this.awaitingPdelayFollowUp) return
+		if (buffer.length < PDELAY_RESP_LENGTH) return
+		if (this.pdelay_seq != sequence) return
+		if (!this.isOurResponse(buffer)) return
+
+		this.awaitingPdelayFollowUp = false
+		this.pt3 = readPtpTimestamp(buffer)
+		this.pdelayCorrection += readCorrectionField(buffer)
+		this.completePdelay(this.pt3 - this.pt2)
+	}
+
+	/**
+	 * meanLinkDelay = [(t4 − t1) − (t3 − t2) − corrections] / 2, per IEEE 1588-2008 §11.4.2.
+	 *
+	 * Note what this is and is not: it is the delay of the single link to the neighbour, not
+	 * the delay to the grandmaster. In a P2P domain the rest of the path arrives already
+	 * summed in the Sync correctionField.
+	 */
+	private completePdelay(turnaround: bigint): void {
+		const delay = (this.pt4 - this.pt1 - turnaround - this.pdelayCorrection) / 2n
+		// A neighbour answering with nonsense would otherwise poison every subsequent offset
+		if (delay < 0n || delay > MAX_PEER_DELAY_NS) return
+
+		this.peerResponding = true
+		if (delay === this.peerMeanPathDelay) return
+		this.peerMeanPathDelay = delay
+		this.emit('peer_delay_changed', delay)
+	}
+
+	/**
+	 * Send a Pdelay_Req to the link-local peer delay group. Unanswered requests are not an
+	 * error: a neighbour that is not a P2P transparent clock simply never replies, and P2P
+	 * then degrades to the passive calculation rather than failing outright.
+	 */
+	private sendPdelayReq(): void {
+		setImmediate(() => {
+			if (this.destroyed) return
+			this.ptpClientEvent.send(this.ptp_pdelay_req(), PTP_EVENT_PORT, PTP_PDELAY_MULTICAST, (err, _bytes) => {
+				if (err) {
+					this.emit('error', err)
+				} else {
+					// only capture t1 after the packet has actually been sent
+					this.pt1 = this.correctedTime()
+				}
+			})
+		})
 	}
 
 	private sendDelayReq(): void {
@@ -691,6 +943,8 @@ export class PTPv2Client extends EventEmitter<PTPv2ClientEvents> {
 		this.syncTimeout = undefined
 		if (this.announceTimeout) clearTimeout(this.announceTimeout)
 		this.announceTimeout = undefined
+		if (this.detectTimeout) clearTimeout(this.detectTimeout)
+		this.detectTimeout = undefined
 		this.ptpClientEvent.removeAllListeners()
 		this.ptpClientEvent.close()
 		this.ptpClientGeneral.removeAllListeners()
@@ -718,6 +972,31 @@ export class PTPv2Client extends EventEmitter<PTPv2ClientEvents> {
 		buffer.writeUInt16BE(this.req_seq, SEQUENCE_OFFSET)
 		buffer.writeUInt8(0x01, CONTROL_FIELD_OFFSET) // controlField: Delay_Req
 		buffer.writeUInt8(0x7f, LOG_MSG_INTERVAL_OFFSET) // logMessageInterval: not periodic
+
+		return buffer
+	}
+
+	/**
+	 * Create ptp pdelay_req buffer
+	 *
+	 */
+
+	private ptp_pdelay_req(): Buffer<ArrayBuffer> {
+		const buffer = Buffer.alloc(PDELAY_REQ_LENGTH)
+		this.pdelay_seq = (this.pdelay_seq + 1) % 0x10000
+		this.awaitingPdelayFollowUp = false
+
+		buffer.writeUInt8(MSG_PDELAY_REQ, 0)
+		buffer.writeUInt8(2, 1)
+		buffer.writeUInt16BE(PDELAY_REQ_LENGTH, 2)
+		buffer.writeUInt8(this.ptp_domain, 4)
+		// The neighbour echoes this back in its response; without it we could not tell our own
+		// exchange apart from that of every other client on the link
+		this.portIdentity.copy(buffer, SOURCE_PORT_IDENTITY_OFFSET)
+		buffer.writeUInt16BE(this.pdelay_seq, SEQUENCE_OFFSET)
+		buffer.writeUInt8(0x05, CONTROL_FIELD_OFFSET) // controlField: all others
+		buffer.writeUInt8(0x7f, LOG_MSG_INTERVAL_OFFSET) // logMessageInterval: not periodic
+		// bytes 44-53 are a reserved tail, transmitted as zero
 
 		return buffer
 	}
@@ -1034,6 +1313,62 @@ export class PTPv2Client extends EventEmitter<PTPv2ClientEvents> {
 
 	public get ptp_version(): string {
 		return `${PTP_VERSION}.${this.minorVersion}`
+	}
+
+	/**
+	 * The delay mechanism actually in use — 'detecting' while auto mode is still listening
+	 *
+	 */
+
+	public get delay_mechanism(): ResolvedDelayMechanism | 'detecting' {
+		return this.resolvedMechanism ?? 'detecting'
+	}
+
+	/** The delay mechanism in use, for display */
+	public get delay_mechanism_label(): string {
+		switch (this.delay_mechanism) {
+			case 'e2e':
+				return 'End to End'
+			case 'p2p':
+				return 'Peer to Peer'
+			case 'passive':
+				return 'Passive'
+			default:
+				return 'Detecting'
+		}
+	}
+
+	/**
+	 * Measured delay of the link to the directly attached neighbour, in nanoseconds. This is
+	 * not the path delay to the grandmaster — in a P2P domain that arrives in the Sync
+	 * correctionField. Zero until a peer delay exchange completes.
+	 *
+	 */
+
+	public get peer_mean_path_delay(): bigint {
+		return this.peerMeanPathDelay
+	}
+
+	/**
+	 * Whether the neighbour has answered a Pdelay_Req. False in a P2P domain means the
+	 * attached port is not acting as a peer delay responder, and the reported time is short
+	 * by one link delay.
+	 *
+	 */
+
+	public get peer_responding(): boolean {
+		return this.peerResponding
+	}
+
+	/**
+	 * Whether any peer delay traffic has been seen on this domain. Meaningful in both
+	 * directions only as evidence of P2P — absence is not evidence of E2E, since Pdelay is
+	 * link-local and a neighbour that is not a P2P clock hides a P2P domain entirely.
+	 *
+	 */
+
+	public get pdelay_seen(): boolean {
+		return this.pdelaySeen
 	}
 
 	/**

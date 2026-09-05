@@ -36,7 +36,7 @@ export function UpdateFeedbacks(self: ModuleInstance): void {
 		[FeedbackIDs.IsSynced]: {
 			type: 'boolean',
 			name: 'PTP Synced',
-			description: 'True while a delay exchange has completed and Sync messages are still arriving',
+			description: 'True while a measurement has completed and Sync messages are still arriving',
 			defaultStyle: alarmStyle,
 			options: [],
 			callback: () => {
@@ -113,7 +113,8 @@ export function UpdateFeedbacks(self: ModuleInstance): void {
 			type: 'boolean',
 			name: 'Mean Path Delay Above',
 			description:
-				'True when the measured mean path delay exceeds the threshold. A rising delay indicates a congested or asymmetric path.',
+				'True when the measured mean path delay exceeds the threshold. A rising delay indicates a congested or asymmetric path. ' +
+				'End to End only — no other delay mechanism measures the path to the master.',
 			defaultStyle: warnStyle,
 			options: [
 				{

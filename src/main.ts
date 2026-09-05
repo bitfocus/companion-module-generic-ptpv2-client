@@ -5,6 +5,7 @@ import { UpgradeScripts } from './upgrades.js'
 import { UpdateActions, type ActionsSchema } from './actions.js'
 import { UpdateFeedbacks, type FeedbacksSchema } from './feedbacks.js'
 import { PTPv2Client, type PtpAnnounce, type PtpFlags } from './ptpv2.js'
+import { PTPv1Client } from './ptpv1.js'
 import { StatusManager } from './status.js'
 
 export type ModuleSchema = {
@@ -19,10 +20,25 @@ export { UpgradeScripts }
 
 export default class ModuleInstance extends InstanceBase<ModuleSchema> {
 	config!: ModuleConfig // Setup in init()
-	client: PTPv2Client | undefined
+	/**
+	 * The two protocols are not versions of one another, so they get separate clients. What
+	 * they share — sync state, master identity, the derived time — is reachable through this
+	 * union; anything protocol-specific goes through `v2` or `v1`.
+	 */
+	client: PTPv2Client | PTPv1Client | undefined
 	statusManager = new StatusManager(this)
 	/** P2P with an unresponsive neighbour is worth saying once, not on every sync */
 	private warnedNoPeerDelay = false
+
+	/** The client when this connection is speaking PTPv2, for everything PTPv1 cannot report */
+	get v2(): PTPv2Client | undefined {
+		return this.client instanceof PTPv2Client ? this.client : undefined
+	}
+
+	/** The client when this connection is speaking PTPv1 */
+	get v1(): PTPv1Client | undefined {
+		return this.client instanceof PTPv1Client ? this.client : undefined
+	}
 
 	constructor(internal: unknown) {
 		super(internal)
@@ -30,9 +46,9 @@ export default class ModuleInstance extends InstanceBase<ModuleSchema> {
 
 	async init(config: ModuleConfig): Promise<void> {
 		this.updateActions() // export actions
-		this.updateFeedbacks() // export feedbacks
-		this.updateVariableDefinitions() // export variable definitions
 		this.statusManager.updateStatus(InstanceStatus.Connecting)
+		// Feedback and variable definitions depend on the protocol in use, so configUpdated
+		// publishes them once the config is in hand
 		void this.configUpdated(config)
 	}
 	// When module gets deleted
@@ -51,13 +67,39 @@ export default class ModuleInstance extends InstanceBase<ModuleSchema> {
 		this.client = undefined
 		this.warnedNoPeerDelay = false
 
+		// Which variables and feedbacks exist depends on the protocol, so they are republished
+		// on every config change rather than only at init
+		this.updateFeedbacks()
+		this.updateVariableDefinitions()
+
 		if (config.interface) {
 			try {
-				// The upgrade script pins pre-existing connections to 'e2e' and the config field
-				// defaults new ones to 'auto', so this only guards against a config that reached
-				// us without going through either
-				this.client = new PTPv2Client(config.interface, config.domain, config.interval, config.delayMechanism ?? 'auto')
-				this.listenForClientEvents()
+				if (config.ptpVersion === 'v1') {
+					const subdomain = v1Subdomain(config)
+					if (subdomain === undefined) {
+						this.statusManager.updateStatus(InstanceStatus.BadConfig, 'Custom subdomain name is not valid')
+						this.log(
+							'warn',
+							`Custom subdomain "${config.customSubdomain}" is not usable: it must be 1 to 15 printable ASCII characters.`,
+						)
+						return
+					}
+					const client = new PTPv1Client(config.interface, subdomain.name, config.interval, subdomain.multicast)
+					this.client = client
+					this.listenForV1ClientEvents(client)
+				} else {
+					// The upgrade script pins pre-existing connections to 'e2e' and the config field
+					// defaults new ones to 'auto', so this only guards against a config that reached
+					// us without going through either
+					const client = new PTPv2Client(
+						config.interface,
+						config.domain,
+						config.interval,
+						config.delayMechanism ?? 'auto',
+					)
+					this.client = client
+					this.listenForClientEvents(client)
+				}
 				this.getVarValues()
 				this.statusManager.updateStatus(InstanceStatus.Ok)
 			} catch (e) {
@@ -69,21 +111,20 @@ export default class ModuleInstance extends InstanceBase<ModuleSchema> {
 		}
 	}
 
-	private listenForClientEvents(): void {
-		if (!this.client) return
-		this.client.on('ptp_master_changed', (ptp_master, master_address, sync) => {
+	private listenForClientEvents(client: PTPv2Client): void {
+		client.on('ptp_master_changed', (ptp_master, master_address, sync) => {
 			this.log('info', `PTPv2 Master Changed: ${ptp_master} Address: ${master_address}`)
 			this.log(sync ? 'info' : 'warn', `PTP Sync Changed. ${sync ? 'Locked' : 'Unlocked'}`)
 			this.checkAllFeedbacks()
 			this.setVariableValues({
 				ptpMaster: ptp_master,
 				ptpMasterAddress: master_address,
-				ptpMasterMac: this.client?.ptp_master_mac ?? '',
-				ptpMasterOui: this.client?.ptp_master_oui ?? '',
-				ptpMasterVendor: this.client?.ptp_master_vendor ?? '',
+				ptpMasterMac: this.v2?.ptp_master_mac ?? '',
+				ptpMasterOui: this.v2?.ptp_master_oui ?? '',
+				ptpMasterVendor: this.v2?.ptp_master_vendor ?? '',
 			})
 		})
-		this.client.on('ptp_time_synced', (time, lastSync) => {
+		client.on('ptp_time_synced', (time, lastSync) => {
 			const syncTime = new Date(lastSync)
 			this.log('debug', `Time Synced ${time}. Timestamp of sync: ${syncTime.toISOString()}`)
 			this.setVariableValues({
@@ -96,8 +137,8 @@ export default class ModuleInstance extends InstanceBase<ModuleSchema> {
 			this.statusManager.updateStatus(InstanceStatus.Ok)
 			this.checkPeerDelay()
 		})
-		this.client.on('delay_mechanism_changed', (mechanism, detected) => {
-			const label = this.client?.delay_mechanism_label ?? mechanism
+		client.on('delay_mechanism_changed', (mechanism, detected) => {
+			const label = this.v2?.delay_mechanism_label ?? mechanism
 			this.log(
 				'info',
 				detected
@@ -107,31 +148,27 @@ export default class ModuleInstance extends InstanceBase<ModuleSchema> {
 			this.setVariableValues({ delayMechanism: label })
 			this.checkAllFeedbacks()
 		})
-		this.client.on('peer_delay_changed', (peerDelay) => {
+		client.on('peer_delay_changed', (peerDelay) => {
 			this.log('debug', `Peer link delay: ${peerDelay}ns`)
 			this.setVariableValues({
 				peerMeanPathDelay: Number(peerDelay),
-				peerDelayResponding: this.client?.peer_responding ?? false,
+				peerDelayResponding: this.v2?.peer_responding ?? false,
 			})
 		})
-		this.client.on('version_changed', (version) => {
+		client.on('version_changed', (version) => {
 			this.log('info', `PTP version in use: ${version}${version === '2.1' ? ' (IEEE 1588-2019)' : ' (IEEE 1588-2008)'}`)
 			this.setVariableValues({ ptpVersion: version })
 			this.checkAllFeedbacks()
 		})
-		this.client.on('master_lost', (reason) => {
+		client.on('master_lost', (reason) => {
 			this.log('warn', `PTP master lost: ${reason}`)
 			this.statusManager.updateStatus(InstanceStatus.ConnectionFailure, reason)
 			this.setVariableValues(
-				announceValues(
-					this.client?.grandmaster,
-					this.client?.last_announce ?? 0,
-					this.client?.grandmaster_address ?? '',
-				),
+				announceValues(this.v2?.grandmaster, this.v2?.last_announce ?? 0, this.v2?.grandmaster_address ?? ''),
 			)
 			this.checkAllFeedbacks()
 		})
-		this.client.on('announce', (announce) => {
+		client.on('announce', (announce) => {
 			this.log(
 				'info',
 				`Grandmaster: ${announce.grandmasterIdentity}${announce.grandmasterVendor ? ` [${announce.grandmasterVendor}]` : ''} ` +
@@ -142,12 +179,10 @@ export default class ModuleInstance extends InstanceBase<ModuleSchema> {
 			if (announce.pathTraceLoop) {
 				this.log('warn', `Path trace contains a repeated clock identity, indicating a loop in the PTP network`)
 			}
-			this.setVariableValues(
-				announceValues(announce, this.client?.last_announce ?? 0, this.client?.grandmaster_address ?? ''),
-			)
+			this.setVariableValues(announceValues(announce, this.v2?.last_announce ?? 0, this.v2?.grandmaster_address ?? ''))
 			this.checkAllFeedbacks()
 		})
-		this.client.on('flags_changed', (flags) => {
+		client.on('flags_changed', (flags) => {
 			if (flags.leap61 || flags.leap59) {
 				this.log('warn', `Leap second pending: ${flags.leap61 ? '+1' : '-1'} second`)
 			}
@@ -155,22 +190,67 @@ export default class ModuleInstance extends InstanceBase<ModuleSchema> {
 			this.setVariableValues(flagValues(flags))
 			this.checkAllFeedbacks()
 		})
-		this.client.on('sync_changed', (sync) => {
+		client.on('sync_changed', (sync) => {
 			this.log(sync ? 'info' : 'warn', `PTP Sync Changed. ${sync ? 'Locked' : 'Unlocked'}`)
 			this.checkAllFeedbacks()
 		})
-		this.client.on('error', (err) => {
+		client.on('error', (err) => {
 			this.statusManager.updateStatus(InstanceStatus.UnknownError, err.message)
 			// Error has no enumerable own properties, so JSON.stringify would render every
 			// real socket failure as '{}'
 			this.log('warn', `Error: ${err.message}`)
 		})
 
-		this.client.on('close', (msg) => {
+		client.on('close', (msg) => {
 			this.log('warn', msg)
 			this.statusManager.updateStatus(InstanceStatus.Disconnected)
 		})
-		this.client.on('listening', (msg) => {
+		client.on('listening', (msg) => {
+			this.log('info', msg)
+			this.statusManager.updateStatus(InstanceStatus.Ok)
+		})
+	}
+
+	/**
+	 * PTPv1 reports a strict subset of what PTPv2 does. There is no Announce message, so no
+	 * grandmaster, no flag field and no path trace; and no delay mechanism to choose, since
+	 * IEEE 1588-2002 defines only the end to end exchange.
+	 */
+	private listenForV1ClientEvents(client: PTPv1Client): void {
+		client.on('ptp_master_changed', (ptp_master, master_address, sync) => {
+			this.log('info', `PTPv1 Master Changed: ${ptp_master} Address: ${master_address}`)
+			this.log(sync ? 'info' : 'warn', `PTP Sync Changed. ${sync ? 'Locked' : 'Unlocked'}`)
+			this.checkAllFeedbacks()
+			this.setVariableValues({ ptpMaster: ptp_master, ptpMasterAddress: master_address })
+		})
+		client.on('ptp_time_synced', (time, lastSync) => {
+			const syncTime = new Date(lastSync)
+			this.log('debug', `Time Synced ${time}. Timestamp of sync: ${syncTime.toISOString()}`)
+			this.setVariableValues(this.sharedValues())
+			this.statusManager.updateStatus(InstanceStatus.Ok)
+		})
+		client.on('sync_changed', (sync) => {
+			this.log(sync ? 'info' : 'warn', `PTP Sync Changed. ${sync ? 'Locked' : 'Unlocked'}`)
+			this.checkAllFeedbacks()
+		})
+		client.on('domains', (subdomains) => {
+			// Two uses. A Dante device's subdomain follows its pull-up/pull-down rate, so an
+			// unexpected name is a device on the wrong clock. And a Dante Domain Manager
+			// network's subdomain name is not chosen by the user at all, so reading it off the
+			// wire here is the only practical way to find out what to configure.
+			const found = [...subdomains]
+			this.log('debug', `PTPv1 subdomains heard: ${found.join(', ')}`)
+			this.setVariableValues({ subdomainsFound: found })
+		})
+		client.on('error', (err) => {
+			this.statusManager.updateStatus(InstanceStatus.UnknownError, err.message)
+			this.log('warn', `Error: ${err.message}`)
+		})
+		client.on('close', (msg) => {
+			this.log('warn', msg)
+			this.statusManager.updateStatus(InstanceStatus.Disconnected)
+		})
+		client.on('listening', (msg) => {
 			this.log('info', msg)
 			this.statusManager.updateStatus(InstanceStatus.Ok)
 		})
@@ -184,15 +264,16 @@ export default class ModuleInstance extends InstanceBase<ModuleSchema> {
 	 * perfect path rather than as no measurement at all, so it is left undefined instead.
 	 */
 	private measurementValues(): Partial<VariablesSchema> {
-		if (!this.client || this.client.last_sync === 0) return {}
-		const mechanism = this.client.delay_mechanism
+		const client = this.v2
+		if (!client || client.last_sync === 0) return {}
+		const mechanism = client.delay_mechanism
 		return {
-			meanPathDelay: mechanism === 'e2e' ? Number(this.client.mean_path_delay) : undefined,
+			meanPathDelay: mechanism === 'e2e' ? Number(client.mean_path_delay) : undefined,
 			peerMeanPathDelay:
-				mechanism === 'p2p' && this.client.peer_responding ? Number(this.client.peer_mean_path_delay) : undefined,
-			peerDelayResponding: this.client.peer_responding,
-			delayMechanism: this.client.delay_mechanism_label,
-			lastCorrection: Number(this.client.last_correction),
+				mechanism === 'p2p' && client.peer_responding ? Number(client.peer_mean_path_delay) : undefined,
+			peerDelayResponding: client.peer_responding,
+			delayMechanism: client.delay_mechanism_label,
+			lastCorrection: Number(client.last_correction),
 		}
 	}
 
@@ -203,8 +284,8 @@ export default class ModuleInstance extends InstanceBase<ModuleSchema> {
 	 */
 	private checkPeerDelay(): void {
 		if (this.warnedNoPeerDelay) return
-		if (!this.client || this.client.delay_mechanism !== 'p2p') return
-		if (this.client.peer_responding) return
+		if (!this.v2 || this.v2.delay_mechanism !== 'p2p') return
+		if (this.v2.peer_responding) return
 		this.warnedNoPeerDelay = true
 		this.log(
 			'warn',
@@ -213,27 +294,48 @@ export default class ModuleInstance extends InstanceBase<ModuleSchema> {
 		)
 	}
 
-	private getVarValues(): void {
-		if (!this.client) return
+	/** The values both protocols can report, from whichever client is running */
+	private sharedValues(): Partial<VariablesSchema> {
+		if (!this.client) return {}
 		const time = this.client.ptp_time
 		const ptp_master = this.client.ptp_master
-		const syncTime = new Date(this.client.last_sync)
-		this.setVariableValues({
-			ptpTimeS: this.client.last_sync == 0 ? undefined : time[0],
-			ptpTimeNS: this.client.last_sync == 0 ? undefined : time[1],
-			ptpTime: this.client.last_sync == 0 ? undefined : this.client.ptp_time_n.toString(),
-			lastSync: this.client.last_sync == 0 ? '' : syncTime.toISOString(),
+		const unsynced = this.client.last_sync === 0
+		return {
+			ptpTimeS: unsynced ? undefined : time[0],
+			ptpTimeNS: unsynced ? undefined : time[1],
+			ptpTime: unsynced ? undefined : this.client.ptp_time_n.toString(),
+			lastSync: unsynced ? '' : new Date(this.client.last_sync).toISOString(),
 			ptpMaster: ptp_master[0],
 			ptpMasterAddress: ptp_master[1],
-			ptpMasterMac: this.client.ptp_master_mac ?? '',
-			ptpMasterOui: this.client.ptp_master_oui,
-			ptpMasterVendor: this.client.ptp_master_vendor ?? '',
-			ptpVersion: this.client.ptp_version,
-			delayMechanism: this.client.delay_mechanism_label,
-			peerDelayResponding: this.client.peer_responding,
+		}
+	}
+
+	private getVarValues(): void {
+		const v1 = this.v1
+		if (v1) {
+			this.setVariableValues({
+				...this.sharedValues(),
+				// IEEE 1588-2002 has no minor version to report
+				ptpVersion: '1.0',
+				subdomain: v1.ptp_subdomain,
+				subdomainsFound: [...v1.subdomains],
+			})
+			this.checkAllFeedbacks()
+			return
+		}
+		const v2 = this.v2
+		if (!v2) return
+		this.setVariableValues({
+			...this.sharedValues(),
+			ptpMasterMac: v2.ptp_master_mac ?? '',
+			ptpMasterOui: v2.ptp_master_oui,
+			ptpMasterVendor: v2.ptp_master_vendor ?? '',
+			ptpVersion: v2.ptp_version,
+			delayMechanism: v2.delay_mechanism_label,
+			peerDelayResponding: v2.peer_responding,
 			...this.measurementValues(),
-			...announceValues(this.client.grandmaster, this.client.last_announce, this.client.grandmaster_address),
-			...flagValues(this.client.ptp_flags),
+			...announceValues(v2.grandmaster, v2.last_announce, v2.grandmaster_address),
+			...flagValues(v2.ptp_flags),
 		})
 		this.checkAllFeedbacks()
 	}
@@ -254,6 +356,20 @@ export default class ModuleInstance extends InstanceBase<ModuleSchema> {
 	updateVariableDefinitions(): void {
 		UpdateVariableDefinitions(this)
 	}
+}
+
+/**
+ * The subdomain name and multicast group a PTPv1 connection should actually use.
+ *
+ * A well-known name carries its own group; a custom one has to be told which group it lives
+ * on. Returns undefined when the custom name is unusable — the config field's regex only
+ * advises the user, it does not prevent the value being stored, so it is checked again here.
+ */
+function v1Subdomain(config: ModuleConfig): { name: string; multicast?: string } | undefined {
+	if (config.subdomain !== 'custom') return { name: config.subdomain ?? '_DFLT' }
+	const name = config.customSubdomain ?? ''
+	if (!/^[\x20-\x7E]{1,15}$/.test(name)) return undefined
+	return { name, multicast: config.customSubdomainGroup ?? '224.0.1.130' }
 }
 
 /**

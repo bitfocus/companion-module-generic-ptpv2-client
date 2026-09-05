@@ -2,9 +2,9 @@
 	"$schema": "../node_modules/@companion-module/base/assets/manifest.schema.json",
 	"type": "connection",
 	"id": "generic-ptpv2-client",
-	"name": "PTPv2 Client",
+	"name": "PTP Monitor",
 	"shortname": "PTPv2",
-	"description": "Monitor PTPv2 on your network",
+	"description": "Monitor PTPv1 or PTPv2 on your network",
 	"version": "0.0.0",
 	"license": "MIT",
 	"repository": "git+https://github.com/bitfocus/companion-module-generic-ptpv2-client.git",
@@ -23,6 +23,6 @@
 	},
 	"legacyIds": [],
 	"manufacturer": "Generic",
-	"products": ["PTP v2"],
-	"keywords": ["Precision Time Protocol", "IEEE 1588-2008", "IEEE 1588-2019"]
+	"products": ["PTP v2", "PTP v1"],
+	"keywords": ["Precision Time Protocol", "IEEE 1588-2008", "IEEE 1588-2019", "IEEE 1588-2002", "Dante"]
 }

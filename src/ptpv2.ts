@@ -7,13 +7,13 @@ import { lookupOui } from './oui.js'
 
 export type PtpTime = [number, number]
 
-// PTPv2 multicast addressing per IEEE 1588-2008 §9.1:
-// Domains 0–3 each have a dedicated multicast address.
-// Domains 4–127 are valid but have no dedicated address; they all share
-// 224.0.1.129 and are differentiated solely by the domain byte in the packet header.
-// Domains 128–255 are reserved by the standard.
+// PTPv2 multicast addressing per IEEE 1588-2008 Annex D:
+// Every domain shares the PTP primary multicast address 224.0.1.129. The domain is carried
+// solely by the domainNumber byte of the header, which is why the receive path filters on it.
+// The per-subdomain addresses 224.0.1.130–132 are an IEEE 1588-2002 (PTPv1) mechanism that
+// PTPv2 replaced with domainNumber; no PTPv2 traffic is ever sent to them.
+// Domains 0–127 are valid; 128–255 are reserved by the standard.
 const PTP_PRIMARY_MULTICAST = '224.0.1.129'
-const ptpDedicatedMulticastAddrs = ['224.0.1.129', '224.0.1.130', '224.0.1.131', '224.0.1.132']
 
 // IEEE 1588-2019 redefined the upper nibble of byte 1, reserved in 2008, as minorVersionPTP.
 // A 2019 device therefore sends 0x12 rather than 0x02, and the version check must mask the
@@ -84,9 +84,6 @@ const MAX_MESSAGE_INTERVAL_MS = 16_000 // logInterval 4
 /** The interval a logMessageInterval denotes, in milliseconds, clamped to a sane range. */
 const messageIntervalMs = (logMessageInterval: number): number =>
 	Math.min(Math.max(Math.pow(2, logMessageInterval) * 1000, MIN_MESSAGE_INTERVAL_MS), MAX_MESSAGE_INTERVAL_MS)
-
-const ptpMulticastAddr = (domain: number): string =>
-	domain <= 3 ? ptpDedicatedMulticastAddrs[domain] : PTP_PRIMARY_MULTICAST
 
 //functions
 
@@ -456,8 +453,8 @@ export class PTPv2Client extends EventEmitter<PTPv2ClientEvents> {
 	 * Initialise the client
 	 *
 	 * @param iface IPv4 address of the interface to bind to (defaults to '0.0.0.0' for all interfaces)
-	 * @param domain PTP domain to listen to (0–127; domains 0–3 use dedicated multicast
-	 *               addresses, domains 4–127 share 224.0.1.129)
+	 * @param domain PTP domain to listen to (0–127; every domain shares the 224.0.1.129
+	 *               multicast group and is distinguished by the header's domainNumber)
 	 * @param interval Minimum PTP sync interval (125ms)
 	 */
 
@@ -638,7 +635,7 @@ export class PTPv2Client extends EventEmitter<PTPv2ClientEvents> {
 	 */
 	private joinMulticast(socket: dgram.Socket): void {
 		try {
-			socket.addMembership(ptpMulticastAddr(this.ptp_domain), this.addr)
+			socket.addMembership(PTP_PRIMARY_MULTICAST, this.addr)
 		} catch (e) {
 			this.emit('error', e instanceof Error ? e : new Error(String(e)))
 		}
@@ -671,19 +668,14 @@ export class PTPv2Client extends EventEmitter<PTPv2ClientEvents> {
 		this.lastRequest = Date.now()
 		setImmediate(() => {
 			if (this.destroyed) return
-			this.ptpClientEvent.send(
-				this.ptp_delay_req(),
-				PTP_EVENT_PORT,
-				ptpMulticastAddr(this.ptp_domain),
-				(err, _bytes) => {
-					if (err) {
-						this.emit('error', err)
-					} else {
-						// only capture t2 after the packet has actually been sent
-						this.t2 = this.correctedTime()
-					}
-				},
-			)
+			this.ptpClientEvent.send(this.ptp_delay_req(), PTP_EVENT_PORT, PTP_PRIMARY_MULTICAST, (err, _bytes) => {
+				if (err) {
+					this.emit('error', err)
+				} else {
+					// only capture t2 after the packet has actually been sent
+					this.t2 = this.correctedTime()
+				}
+			})
 		})
 	}
 

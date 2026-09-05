@@ -258,31 +258,32 @@ describe('constructor – domain parameter', () => {
 
 	it('rounds a fractional domain', async () => {
 		const client = await makeClient('0.0.0.0', 1.7) // rounds to 2
-		// domain 2 → 224.0.1.131
-		expect(eventSocket().addMembership).toHaveBeenCalledWith('224.0.1.131', '0.0.0.0')
-		client.destroy()
-	})
-
-	// Domains 0–3: dedicated multicast addresses
-	it.each([
-		[0, '224.0.1.129'],
-		[1, '224.0.1.130'],
-		[2, '224.0.1.131'],
-		[3, '224.0.1.132'],
-	])('domain %i joins dedicated multicast address %s', async (domain, multicast) => {
-		const client = await makeClient('0.0.0.0', domain)
-		expect(eventSocket().addMembership).toHaveBeenCalledWith(multicast, '0.0.0.0')
-		client.destroy()
-	})
-
-	// Domains 4–127: all share 224.0.1.129
-	it.each([4, 5, 16, 63, 127])('domain %i (above 3) joins primary multicast address 224.0.1.129', async (domain) => {
-		const client = await makeClient('0.0.0.0', domain)
 		expect(eventSocket().addMembership).toHaveBeenCalledWith('224.0.1.129', '0.0.0.0')
 		client.destroy()
 	})
 
-	it('two different high domains both join 224.0.1.129 (not separate addresses)', async () => {
+	// IEEE 1588-2008 Annex D: every domain uses the primary multicast address. Joining
+	// 224.0.1.130–132 for domains 1–3 is PTPv1 subdomain addressing and receives nothing.
+	it.each([0, 1, 2, 3, 4, 5, 16, 63, 127])(
+		'domain %i joins the primary multicast address 224.0.1.129',
+		async (domain) => {
+			const client = await makeClient('0.0.0.0', domain)
+			expect(eventSocket().addMembership).toHaveBeenCalledWith('224.0.1.129', '0.0.0.0')
+			expect(generalSocket().addMembership).toHaveBeenCalledWith('224.0.1.129', '0.0.0.0')
+			client.destroy()
+		},
+	)
+
+	it.each([1, 2, 3])('domain %i never joins a PTPv1 subdomain address', async (domain) => {
+		const client = await makeClient('0.0.0.0', domain)
+		for (const addr of ['224.0.1.130', '224.0.1.131', '224.0.1.132']) {
+			expect(eventSocket().addMembership).not.toHaveBeenCalledWith(addr, '0.0.0.0')
+			expect(generalSocket().addMembership).not.toHaveBeenCalledWith(addr, '0.0.0.0')
+		}
+		client.destroy()
+	})
+
+	it('two different domains both join 224.0.1.129 (not separate addresses)', async () => {
 		const clientA = await makeClient('0.0.0.0', 10)
 		const clientB = await makeClient('0.0.0.0', 20)
 		// Both should join the same primary address

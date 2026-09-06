@@ -71,6 +71,16 @@ jobs:
           CI: true
       - name: Run tests
         run: |
-          yarn test
+          yarn test:coverage
         env:
           CI: true
+      - name: Send coverage
+        uses: codecov/codecov-action@v5
+        with:
+          # Optional for public repos, but uploads are rate-limited without it.
+          # Add CODECOV_TOKEN as a repository secret to make uploads reliable.
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: ./coverage/lcov.info
+          # codecov-action defaults this to false, so a failed upload reports a
+          # warning rather than failing the build. Set true to make it blocking.
+          fail_ci_if_error: false

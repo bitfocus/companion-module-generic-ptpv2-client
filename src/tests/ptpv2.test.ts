@@ -23,6 +23,7 @@ class MockSocket {
 	addMembership = vi.fn(() => {
 		if (addMembershipError) throw addMembershipError
 	})
+	setMulticastInterface = vi.fn()
 	send = vi.fn((_buf: Buffer, _port: number, _addr: string, cb?: (err: Error | null) => void) => {
 		// Real dgram throws synchronously on a closed socket rather than reporting via cb
 		if (this.closed) {
@@ -377,6 +378,24 @@ describe('socket bind addresses', () => {
 		const client = await makeClient('10.0.0.1')
 		expect(eventSocket().addMembership).toHaveBeenCalledWith('224.0.1.129', '10.0.0.1')
 		expect(generalSocket().addMembership).toHaveBeenCalledWith('224.0.1.129', '10.0.0.1')
+		client.destroy()
+	})
+
+	it('pins outgoing multicast to the configured interface', async () => {
+		// addMembership only selects the interface datagrams are received on. Egress follows
+		// the host route for 224.0.0.0/4, so on a multi-homed host the Delay_Req can leave by
+		// a different NIC than the Sync arrived on — Sync and Announce are heard, nothing is
+		// ever answered, and the clock never locks.
+		const client = await makeClient('10.0.0.1')
+		expect(eventSocket().setMulticastInterface).toHaveBeenCalledWith('10.0.0.1')
+		expect(generalSocket().setMulticastInterface).toHaveBeenCalledWith('10.0.0.1')
+		client.destroy()
+	})
+
+	it('leaves the egress interface to the host when bound to INADDR_ANY', async () => {
+		const client = await makeClient('0.0.0.0')
+		expect(eventSocket().setMulticastInterface).not.toHaveBeenCalled()
+		expect(generalSocket().setMulticastInterface).not.toHaveBeenCalled()
 		client.destroy()
 	})
 })

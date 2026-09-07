@@ -75,17 +75,19 @@ export const multicastForSubdomain = (subdomain: string): string | undefined =>
 const PTP_EVENT_PORT = 319
 const PTP_GENERAL_PORT = 320
 
-// PTPv1 message types (byte 20 of header)
-const MSG_SYNC = 0x01
-const MSG_DELAY_REQ = 0x02
-const MSG_FOLLOW_UP = 0x03
-const MSG_DELAY_RESP = 0x04
+// PTPv1 messageType (byte 20 of header). This is only the message *class* — which of the
+// two ports the message belongs on — not which message it is. IEEE 1588-2002 §6.2.2.2
+// defines exactly two values, and every Sync and Delay_Req on the wire carries EVENT while
+// every Follow_Up, Delay_Resp and Management message carries GENERAL.
+const MSG_TYPE_EVENT = 0x01
 
-// PTPv1 control field values (byte 32 of header)
+// PTPv1 control field values (byte 32 of header). *This* is what identifies the message;
+// dispatch is keyed on it, never on messageType.
 export const CTRL_SYNC = 0x00
 export const CTRL_DELAY_REQ = 0x01
 export const CTRL_FOLLOW_UP = 0x02
 export const CTRL_DELAY_RSP = 0x03
+export const CTRL_MANAGEMENT = 0x04
 
 // PTPv1 flags (uint16 BE at byte 34):
 // Bit 3 is PTP_ASSIST — set by a two-step master to indicate a Follow_Up will follow.
@@ -97,12 +99,12 @@ const FLAG_ASSIST = 0x0008
 // Bytes  0–1  : versionPTP      (uint16 BE, value = 1)
 // Bytes  2–3  : versionNetwork  (uint16 BE)
 // Bytes  4–19 : subdomain name  (16 bytes, null-terminated, null-padded)
-// Byte   20   : messageType
+// Byte   20   : messageType     (1 = event, 2 = general — the class, not the message)
 // Byte   21   : sourceCommunicationTechnology
 // Bytes 22–27 : sourceUuid      (6 bytes — an EUI-48, i.e. the port's MAC)
 // Bytes 28–29 : sourcePortId    (uint16 BE)
 // Bytes 30–31 : sequenceId      (uint16 BE)
-// Byte   32   : control
+// Byte   32   : control         (0 Sync, 1 Delay_Req, 2 Follow_Up, 3 Delay_Resp, 4 Mgmt)
 // Byte   33   : reserved
 // Bytes 34–35 : flags           (uint16 BE)
 // Bytes 36–39 : reserved
@@ -416,7 +418,7 @@ export class PTPv1Client extends EventEmitter<PTPv1ClientEvents> {
 
 			if (buffer.length < HEADER_LENGTH) return
 
-			const msgType = buffer.readUInt8(MESSAGE_TYPE_OFFSET)
+			const control = buffer.readUInt8(CONTROL_OFFSET)
 			const sequence = buffer.readUInt16BE(SEQUENCE_OFFSET)
 			const flags = buffer.readUInt16BE(FLAGS_OFFSET)
 
@@ -424,8 +426,11 @@ export class PTPv1Client extends EventEmitter<PTPv1ClientEvents> {
 			const pktSubdomain = decodeSubdomain(buffer)
 			if (pktSubdomain) this.addSubdomain(pktSubdomain)
 
-			// Only process Sync messages for our configured subdomain
-			if (msgType !== MSG_SYNC) return
+			// Only process Sync messages for our configured subdomain. The port already
+			// separates event from general, so control is the only field that has to be
+			// read — and it is the one that distinguishes a master's Sync from another
+			// slave's Delay_Req, which is the other message arriving on this port.
+			if (control !== CTRL_SYNC) return
 			if (!buffer.subarray(SUBDOMAIN_OFFSET, SUBDOMAIN_END).equals(this.subdomainBuf)) return
 
 			const source = formatSourceId(buffer)
@@ -465,7 +470,7 @@ export class PTPv1Client extends EventEmitter<PTPv1ClientEvents> {
 		this.ptpClientGeneral.on('message', (buffer, _rinfo): void => {
 			if (buffer.length < HEADER_LENGTH) return
 
-			const msgType = buffer.readUInt8(MESSAGE_TYPE_OFFSET)
+			const control = buffer.readUInt8(CONTROL_OFFSET)
 
 			// Track subdomains regardless of filter
 			const pktSubdomain = decodeSubdomain(buffer)
@@ -474,7 +479,7 @@ export class PTPv1Client extends EventEmitter<PTPv1ClientEvents> {
 			// Only process messages for our configured subdomain
 			if (!buffer.subarray(SUBDOMAIN_OFFSET, SUBDOMAIN_END).equals(this.subdomainBuf)) return
 
-			if (msgType === MSG_FOLLOW_UP) {
+			if (control === CTRL_FOLLOW_UP) {
 				if (buffer.length < FU_LENGTH) return
 				// A Follow_Up carries its own sequenceId in the header and the sequenceId of
 				// the Sync it belongs to in associatedSequenceId. Only the latter identifies
@@ -488,7 +493,7 @@ export class PTPv1Client extends EventEmitter<PTPv1ClientEvents> {
 				return
 			}
 
-			if (msgType === MSG_DELAY_RESP) {
+			if (control === CTRL_DELAY_RSP) {
 				if (buffer.length < DR_LENGTH) return
 				if (!this.isOurDelayResp(buffer)) return
 
@@ -620,16 +625,17 @@ export class PTPv1Client extends EventEmitter<PTPv1ClientEvents> {
 	 *   Bytes  0–1  : versionPTP = 1       (uint16 BE)
 	 *   Bytes  2–3  : versionNetwork = 1   (uint16 BE)
 	 *   Bytes  4–19 : subdomain name       (16 bytes, null-padded)
-	 *   Byte   20   : messageType = 0x02
-	 *   Byte   21   : sourceCommunicationTechnology = 0 (unknown)
-	 *   Bytes 22–27 : sourceUuid           (zeroed — we are a slave with no UUID)
-	 *   Bytes 28–29 : sourcePortId         (zeroed)
+	 *   Byte   20   : messageType = 0x01    (event — Delay_Req travels on port 319)
+	 *   Byte   21   : sourceCommunicationTechnology = 0x01 (IEEE 802.3)
+	 *   Bytes 22–27 : sourceUuid           (our MAC, echoed back in the Delay_Resp)
+	 *   Bytes 28–29 : sourcePortId         (uint16 BE)
 	 *   Bytes 30–31 : sequenceId           (uint16 BE)
-	 *   Byte   32   : control = 0x01
+	 *   Byte   32   : control = 0x01        (Delay_Req — this is what identifies the message)
 	 *   Byte   33   : reserved
 	 *   Bytes 34–35 : flags                (zeroed)
-	 *   Bytes 36–39 : originTimestamp.seconds     (zeroed)
-	 *   Bytes 40–43 : originTimestamp.nanoseconds (zeroed)
+	 *   Bytes 36–39 : reserved
+	 *   Bytes 40–43 : originTimestamp.seconds     (zeroed)
+	 *   Bytes 44–47 : originTimestamp.nanoseconds (zeroed)
 	 */
 	private ptp_delay_req(): Buffer {
 		const buffer = Buffer.alloc(SDR_LENGTH, 0)
@@ -638,7 +644,9 @@ export class PTPv1Client extends EventEmitter<PTPv1ClientEvents> {
 		buffer.writeUInt16BE(1, 0) // versionPTP
 		buffer.writeUInt16BE(1, 2) // versionNetwork
 		this.subdomainBuf.copy(buffer, SUBDOMAIN_OFFSET)
-		buffer.writeUInt8(MSG_DELAY_REQ, MESSAGE_TYPE_OFFSET)
+		// A Delay_Req is an event message; the control field below is what says it is a
+		// Delay_Req rather than a Sync
+		buffer.writeUInt8(MSG_TYPE_EVENT, MESSAGE_TYPE_OFFSET)
 		buffer.writeUInt8(0x01, MESSAGE_TYPE_OFFSET + 1) // sourceCommunicationTechnology: IEEE 802.3
 		// Without a sourceUuid the master echoes back all zeroes, leaving every client on the
 		// network indistinguishable in the Delay_Resp
@@ -702,13 +710,25 @@ export class PTPv1Client extends EventEmitter<PTPv1ClientEvents> {
 	}
 
 	/**
-	 * Join the multicast group for the configured subdomain.
-	 * addMembership throws synchronously if the interface has gone away, which would
-	 * otherwise escape from the 'listening' handler and take the process down.
+	 * Join the multicast group for the configured subdomain, and pin the socket's outgoing
+	 * multicast to the same interface.
+	 *
+	 * Joining and sending are selected by different mechanisms, and only the join is named by
+	 * addMembership. Egress otherwise follows the host's route for 224.0.0.0/4, which on a
+	 * machine with more than one interface is whichever one the kernel matched first — not
+	 * necessarily the one the PTP domain is on. The receive path works either way, so the
+	 * failure is silent and one-sided: Sync and Announce arrive, Delay_Req leaves by the wrong
+	 * NIC and is never answered, and the clock never locks.
+	 *
+	 * '0.0.0.0' is the request to leave that choice to the host, so it is left alone.
+	 *
+	 * Both throw synchronously if the interface has gone away, which would otherwise escape
+	 * from the 'listening' handler and take the process down.
 	 */
 	private joinMulticast(socket: dgram.Socket): void {
 		try {
 			socket.addMembership(this.multicast, this.addr)
+			if (this.addr !== '0.0.0.0') socket.setMulticastInterface(this.addr)
 		} catch (e) {
 			this.emit('error', e instanceof Error ? e : new Error(String(e)))
 		}

@@ -13,6 +13,7 @@ class MockSocket {
 		setImmediate(() => this.emit('listening'))
 	})
 	addMembership = vi.fn()
+	setMulticastInterface = vi.fn()
 	send = vi.fn((_buf: Buffer, _port: number, _addr: string, cb?: (err: Error | null) => void) => {
 		if (this.closed) {
 			const err = new Error('Not running') as NodeJS.ErrnoException
@@ -84,14 +85,29 @@ type PTP_SUBDOMAINS = import('../ptpv1.js').PTP_SUBDOMAINS
 //   40-43 originTimestamp.seconds       (uint32 BE)
 //   44-47 originTimestamp.nanoseconds   (int32 BE, signed per spec)
 
-const MSG_SYNC = 0x01
-const MSG_DELAY_REQ = 0x02
-const MSG_FOLLOW_UP = 0x03
-const MSG_DELAY_RESP = 0x04
+// Byte 20 is the message *class*, not the message: IEEE 1588-2002 defines only event and
+// general. Which message a packet is comes from the control field at byte 32, so these
+// helpers write both — a packet that carries the message id at byte 20 is one no device
+// sends, and testing against one proves nothing about the wire.
+const MSG_TYPE_EVENT = 0x01
+const MSG_TYPE_GENERAL = 0x02
+
+const CTRL_SYNC = 0x00
+const CTRL_DELAY_REQ = 0x01
+const CTRL_FOLLOW_UP = 0x02
+const CTRL_DELAY_RESP = 0x03
+const CTRL_MANAGEMENT = 0x04
+
+/** The port a message belongs on, per IEEE 1588-2002 §6.2.2.2 */
+const classOf = (control: number): number =>
+	control === CTRL_SYNC || control === CTRL_DELAY_REQ ? MSG_TYPE_EVENT : MSG_TYPE_GENERAL
+
 const FLAG_ASSIST = 0x0008 // two-step: a Follow_Up will carry the precise timestamp
 
 interface PacketOpts {
 	subdomain?: string
+	control?: number
+	/** Overrides the class byte 20 would otherwise get from `control` */
 	msgType?: number
 	uuid?: string
 	portId?: number
@@ -106,7 +122,8 @@ interface PacketOpts {
 
 const makePacket = ({
 	subdomain = '_DFLT',
-	msgType = MSG_SYNC,
+	control = CTRL_SYNC,
+	msgType,
 	uuid = 'aabbccddeeff',
 	portId = 1,
 	sequence = 1,
@@ -121,10 +138,11 @@ const makePacket = ({
 	buf.writeUInt16BE(version, 0)
 	buf.writeUInt16BE(1, 2)
 	Buffer.from(subdomain, 'ascii').copy(buf, 4, 0, Math.min(subdomain.length, 15))
-	buf.writeUInt8(msgType, 20)
+	buf.writeUInt8(msgType ?? classOf(control), 20)
 	Buffer.from(uuid, 'hex').copy(buf, 22)
 	buf.writeUInt16BE(portId, 28)
 	buf.writeUInt16BE(sequence, 30)
+	buf.writeUInt8(control, 32)
 	buf.writeUInt16BE(flags, 34)
 	// 36-39 is the reserved word that makes the header 40 bytes rather than 36. Filling it
 	// with something recognisable means a body read that is 4 bytes early cannot pass by
@@ -135,14 +153,14 @@ const makePacket = ({
 	return buf
 }
 
-const makeSync = (o: PacketOpts = {}) => makePacket({ ...o, msgType: MSG_SYNC })
+const makeSync = (o: PacketOpts = {}) => makePacket({ ...o, control: CTRL_SYNC })
 
 /**
  * A Follow_Up does not share the Sync body layout: associatedSequenceId sits at 42 and
  * pushes preciseOriginTimestamp out to 44/48.
  */
 const makeFollowUp = (o: PacketOpts & { associatedSequence?: number } = {}): Buffer => {
-	const buf = makePacket({ ...o, msgType: MSG_FOLLOW_UP, length: 52 })
+	const buf = makePacket({ ...o, control: CTRL_FOLLOW_UP, length: 52 })
 	buf.writeUInt16BE(o.associatedSequence ?? o.sequence ?? 1, 42)
 	buf.writeUInt32BE((o.tsSeconds ?? 0) >>> 0, 44)
 	buf.writeInt32BE(o.tsNanos ?? 0, 48)
@@ -157,7 +175,7 @@ interface Requester {
 }
 
 const makeDelayResp = (requester: Requester | undefined, o: PacketOpts = {}): Buffer => {
-	const buf = makePacket({ ...o, msgType: MSG_DELAY_RESP, length: 60 })
+	const buf = makePacket({ ...o, control: CTRL_DELAY_RESP, length: 60 })
 	if (requester) {
 		Buffer.from(requester.uuid, 'hex').copy(buf, 50)
 		buf.writeUInt16BE(requester.portId, 56)
@@ -250,6 +268,26 @@ describe('PTPv1 sockets', () => {
 		expect(eventSocket().bind).toHaveBeenCalledWith(319)
 		expect(generalSocket().bind).toHaveBeenCalledWith(320)
 		expect(eventSocket().addMembership).toHaveBeenCalledWith('224.0.1.129', '192.168.1.10')
+		client.destroy()
+	})
+
+	it('pins outgoing multicast to the configured interface', async () => {
+		// addMembership only selects the interface datagrams are received on. Egress follows
+		// the host route for 224.0.0.0/4, so on a multi-homed host the Delay_Req can leave by
+		// a different NIC than the Sync arrived on — Sync is heard, nothing is ever answered,
+		// and the clock never locks.
+		const client = await makeClient('192.168.1.10')
+		expect(eventSocket().setMulticastInterface).toHaveBeenCalledWith('192.168.1.10')
+		expect(generalSocket().setMulticastInterface).toHaveBeenCalledWith('192.168.1.10')
+		client.destroy()
+	})
+
+	it('leaves the egress interface to the host when bound to INADDR_ANY', async () => {
+		// '0.0.0.0' is the request to let the host choose, and setMulticastInterface has no
+		// meaningful argument to be given for it
+		const client = await makeClient('0.0.0.0')
+		expect(eventSocket().setMulticastInterface).not.toHaveBeenCalled()
+		expect(generalSocket().setMulticastInterface).not.toHaveBeenCalled()
 		client.destroy()
 	})
 
@@ -457,7 +495,7 @@ describe('PTPv1 message filtering', () => {
 		const client = await makeClient()
 		const changed = vi.fn()
 		client.on('ptp_master_changed', changed)
-		eventSocket().emit('message', makePacket({ msgType: MSG_DELAY_REQ }), rinfo)
+		eventSocket().emit('message', makePacket({ control: CTRL_DELAY_REQ }), rinfo)
 		expect(changed).not.toHaveBeenCalled()
 		client.destroy()
 	})
@@ -494,8 +532,8 @@ describe('PTPv1 Delay_Req', () => {
 		expect(buf.readUInt16BE(0)).toBe(1) // versionPTP
 		expect(buf.readUInt16BE(2)).toBe(1) // versionNetwork
 		expect(buf.toString('ascii', 4, 9)).toBe('_DFLT') // subdomain
-		expect(buf.readUInt8(20)).toBe(MSG_DELAY_REQ)
-		expect(buf.readUInt8(32)).toBe(0x01) // control: Delay_Req
+		expect(buf.readUInt8(20)).toBe(MSG_TYPE_EVENT) // class: a Delay_Req rides on port 319
+		expect(buf.readUInt8(32)).toBe(CTRL_DELAY_REQ) // control: what makes it a Delay_Req
 		client.destroy()
 	})
 
@@ -725,9 +763,79 @@ describe('PTPv1 timestamps and offset', () => {
 	it('ignores a Follow_Up too short to hold its timestamp', async () => {
 		const client = await startClient()
 		eventSocket().emit('message', makeSync({ flags: FLAG_ASSIST, sequence: 7 }), rinfo)
-		generalSocket().emit('message', makePacket({ msgType: MSG_FOLLOW_UP, length: 48 }), rinfo)
+		generalSocket().emit('message', makePacket({ control: CTRL_FOLLOW_UP, length: 48 }), rinfo)
 		await vi.advanceTimersByTimeAsync(0)
 		expect(eventSocket().send).not.toHaveBeenCalled()
+		client.destroy()
+	})
+})
+
+// ===========================================================================
+// Message identification
+// ===========================================================================
+/**
+ * IEEE 1588-2002 splits identification across two fields, and only one of them says which
+ * message this is. messageType (byte 20) is the class — event or general, i.e. which of the
+ * two ports the message belongs on — so every Sync and Delay_Req carries 1 and every
+ * Follow_Up, Delay_Resp and Management message carries 2. The control field (byte 32) is
+ * what distinguishes the messages within a class. Dispatching on byte 20 as though it held
+ * the message id silently drops every general message, because no master ever puts a 3 or a
+ * 4 there.
+ */
+describe('PTPv1 message identification', () => {
+	it('identifies a Delay_Resp by control, not by messageType', async () => {
+		const client = await makeClient()
+		await syncAndRequest()
+		const seq = eventSocket().send.mock.calls[0][0].readUInt16BE(30)
+		const resp = respondTo(client, seq)
+		// What a real master puts in byte 20: general, shared with every Follow_Up
+		expect(resp.readUInt8(20)).toBe(MSG_TYPE_GENERAL)
+		expect(resp.readUInt8(32)).toBe(CTRL_DELAY_RESP)
+		generalSocket().emit('message', resp, rinfo)
+		expect(client.is_synced).toBe(true)
+		expect(client.last_sync).not.toBe(0)
+		client.destroy()
+	})
+
+	it('identifies a Follow_Up by control, not by messageType', async () => {
+		const client = await makeClient()
+		const fu = makeFollowUp({ sequence: 7 })
+		expect(fu.readUInt8(20)).toBe(MSG_TYPE_GENERAL)
+		expect(fu.readUInt8(32)).toBe(CTRL_FOLLOW_UP)
+		eventSocket().emit('message', makeSync({ flags: FLAG_ASSIST, sequence: 7 }), rinfo)
+		generalSocket().emit('message', fu, rinfo)
+		await new Promise<void>((r) => setImmediate(r))
+		expect(eventSocket().send).toHaveBeenCalledTimes(1)
+		client.destroy()
+	})
+
+	it('does not mistake another slave for the master when both share the event class', async () => {
+		// A Delay_Req is an event message exactly as a Sync is, so byte 20 cannot tell them
+		// apart — keying on it would make every slave on the subdomain look like a master
+		const client = await makeClient()
+		const changed = vi.fn()
+		client.on('ptp_master_changed', changed)
+		eventSocket().emit('message', makeSync(), rinfo)
+		const otherSlave = makePacket({ control: CTRL_DELAY_REQ, uuid: '112233445566' })
+		expect(otherSlave.readUInt8(20)).toBe(makeSync().readUInt8(20))
+		eventSocket().emit('message', otherSlave, rinfo)
+		expect(changed).toHaveBeenCalledTimes(1)
+		expect(client.ptp_master[0]).toBe('aa-bb-cc-dd-ee-ff:1')
+		client.destroy()
+	})
+
+	it('ignores a Management message on the general socket', async () => {
+		const client = await makeClient()
+		await syncAndRequest()
+		const seq = eventSocket().send.mock.calls[0][0].readUInt16BE(30)
+		// Same class as a Delay_Resp, and stamped with our identity where one would carry it
+		const mgmt = makePacket({ control: CTRL_MANAGEMENT, length: 60 })
+		Buffer.from(client.source_uuid, 'hex').copy(mgmt, 50)
+		mgmt.writeUInt16BE(client.source_port_id, 56)
+		mgmt.writeUInt16BE(seq, 58)
+		expect(mgmt.readUInt8(20)).toBe(MSG_TYPE_GENERAL)
+		generalSocket().emit('message', mgmt, rinfo)
+		expect(client.is_synced).toBe(false)
 		client.destroy()
 	})
 })
@@ -793,7 +901,7 @@ describe('PTPv1 Delay_Resp ownership', () => {
 	it('ignores a Delay_Resp too short to carry the requesting identity', async () => {
 		const client = await makeClient()
 		const seq = await completeExchange()
-		generalSocket().emit('message', makePacket({ msgType: MSG_DELAY_RESP, length: 48, sequence: seq }), rinfo)
+		generalSocket().emit('message', makePacket({ control: CTRL_DELAY_RESP, length: 48, sequence: seq }), rinfo)
 		expect(client.is_synced).toBe(false)
 		client.destroy()
 	})

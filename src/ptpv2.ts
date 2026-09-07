@@ -726,9 +726,20 @@ export class PTPv2Client extends EventEmitter<PTPv2ClientEvents> {
 	}
 
 	/**
-	 * Join the PTP multicast group on the configured interface.
-	 * addMembership throws synchronously if the interface has gone away, which would
-	 * otherwise escape from the 'listening' handler and take the process down.
+	 * Join the PTP multicast group on the configured interface, and pin the socket's outgoing
+	 * multicast to the same interface.
+	 *
+	 * Joining and sending are selected by different mechanisms, and only the join is named by
+	 * addMembership. Egress otherwise follows the host's route for 224.0.0.0/4, which on a
+	 * machine with more than one interface is whichever one the kernel matched first — not
+	 * necessarily the one the PTP domain is on. The receive path works either way, so the
+	 * failure is silent and one-sided: Sync and Announce arrive, Delay_Req leaves by the wrong
+	 * NIC and is never answered, and the clock never locks.
+	 *
+	 * '0.0.0.0' is the request to leave that choice to the host, so it is left alone.
+	 *
+	 * Both throw synchronously if the interface has gone away, which would otherwise escape
+	 * from the 'listening' handler and take the process down.
 	 */
 	private joinMulticast(socket: dgram.Socket): void {
 		try {
@@ -737,6 +748,7 @@ export class PTPv2Client extends EventEmitter<PTPv2ClientEvents> {
 			// its own responses, auto needs it to detect at all, and passive uses it to report
 			// what the domain is really running. Only an explicit e2e has no use for it.
 			if (this.delayMechanism !== 'e2e') socket.addMembership(PTP_PDELAY_MULTICAST, this.addr)
+			if (this.addr !== '0.0.0.0') socket.setMulticastInterface(this.addr)
 		} catch (e) {
 			this.emit('error', e instanceof Error ? e : new Error(String(e)))
 		}

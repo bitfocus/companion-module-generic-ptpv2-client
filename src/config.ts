@@ -30,6 +30,8 @@ export type ModuleConfig = {
 const isV2 = `$(options:ptpVersion) == 'v2'`
 const isV1 = `$(options:ptpVersion) == 'v1'`
 const isV1Custom = `${isV1} && $(options:subdomain) == 'custom'`
+/** A domain IEEE 1588-2008 reserved, so selecting one asserts the network is 1588-2019 */
+const isV2Domain2019 = `${isV2} && $(options:domain) > 127`
 
 export function GetConfigFields(): SomeCompanionConfigField[] {
 	const isLinuxUser = os.platform() === 'linux' && os.userInfo().username !== 'root'
@@ -81,11 +83,24 @@ export function GetConfigFields(): SomeCompanionConfigField[] {
 			label: 'Domain',
 			width: 4,
 			min: 0,
-			max: 127,
+			max: 255,
 			default: 0,
 			range: true,
 			step: 1,
 			isVisibleExpression: isV2,
+			// Referenced by the isVisibleExpression of the warning below
+			disableAutoExpression: true,
+		},
+		{
+			type: 'static-text',
+			id: 'domainHelp',
+			label: '',
+			isVisibleExpression: isV2Domain2019,
+			value:
+				`Domains above 127 are <strong>IEEE 1588-2019 only</strong>. IEEE 1588-2008 defines domains 0–127 and reserves 128–255, ` +
+				`so a 2008 grandmaster will never use this domain and nothing will be heard on it. ` +
+				`The common profiles all sit well below: SMPTE ST 2059-2 uses 127, AES67 and gPTP use 0.`,
+			width: 12,
 		},
 		{
 			type: 'dropdown',

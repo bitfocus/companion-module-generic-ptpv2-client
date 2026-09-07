@@ -12,7 +12,11 @@ export type PtpTime = [number, number]
 // solely by the domainNumber byte of the header, which is why the receive path filters on it.
 // The per-subdomain addresses 224.0.1.130–132 are an IEEE 1588-2002 (PTPv1) mechanism that
 // PTPv2 replaced with domainNumber; no PTPv2 traffic is ever sent to them.
-// Domains 0–127 are valid; 128–255 are reserved by the standard.
+// IEEE 1588-2008 defines domains 0–127 and reserves 128–255; IEEE 1588-2019 revised the
+// domain specification and permits the full 0–255. Both are accepted here, because a
+// domain this client cannot select is a domain it cannot monitor, and refusing one that
+// a 2019 grandmaster is legitimately using would be the worse failure. A domain above
+// 127 simply implies the network is 2019.
 const PTP_PRIMARY_MULTICAST = '224.0.1.129'
 // The peer delay mechanism has its own group, and it is deliberately link-local: 224.0.0.0/24
 // is never forwarded by a router. Pdelay therefore only ever reaches the device on the other
@@ -512,8 +516,9 @@ export class PTPv2Client extends EventEmitter<PTPv2ClientEvents> {
 	 * Initialise the client
 	 *
 	 * @param iface IPv4 address of the interface to bind to (defaults to '0.0.0.0' for all interfaces)
-	 * @param domain PTP domain to listen to (0–127; every domain shares the 224.0.1.129
-	 *               multicast group and is distinguished by the header's domainNumber)
+	 * @param domain PTP domain to listen to (0–255; every domain shares the 224.0.1.129
+	 *               multicast group and is distinguished by the header's domainNumber.
+	 *               Above 127 requires an IEEE 1588-2019 network — see the note at the top)
 	 * @param interval Minimum PTP sync interval (125ms)
 	 * @param delayMechanism How to establish path delay: 'e2e', 'p2p', 'passive', or 'auto'
 	 *                       to detect between P2P and E2E by listening first (default)
@@ -532,7 +537,7 @@ export class PTPv2Client extends EventEmitter<PTPv2ClientEvents> {
 			)
 		}
 		this.addr = iface
-		if (domain >= 0 && domain <= 127) this.ptp_domain = Math.round(domain)
+		if (domain >= 0 && domain <= 255) this.ptp_domain = Math.round(domain)
 		if (interval >= 125) this.minSyncInterval = Math.round(interval)
 		this.delayMechanism = delayMechanism
 
@@ -1051,7 +1056,8 @@ export class PTPv2Client extends EventEmitter<PTPv2ClientEvents> {
 	 */
 
 	private addDomain(domain: number): void {
-		if (domain > 127) return // 128–255 are reserved by the standard
+		// No upper filter: the byte cannot exceed 255, and 128–255 are a legitimate IEEE
+		// 1588-2019 domain rather than something to discard
 		if (this.domainsFound.has(domain)) return
 		this.domainsFound.add(domain)
 		this.emit(`domains`, this.domainsFound.values())

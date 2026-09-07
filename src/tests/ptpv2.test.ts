@@ -277,7 +277,9 @@ describe('constructor – iface validation', () => {
 // Constructor – domain clamping
 // ===========================================================================
 describe('constructor – domain parameter', () => {
-	it.each([0, 1, 2, 3, 4, 63, 127])('accepts domain %i', (d) => {
+	// 128–255 are reserved by IEEE 1588-2008 but valid under 1588-2019, which this client
+	// also speaks, so the whole byte is accepted
+	it.each([0, 1, 2, 3, 4, 63, 127, 128, 200, 255])('accepts domain %i', (d) => {
 		expect(() => new PTPv2Client('0.0.0.0', d)).not.toThrow()
 	})
 
@@ -288,8 +290,8 @@ describe('constructor – domain parameter', () => {
 		client.destroy()
 	})
 
-	it('clamps domain > 127 to default 0', async () => {
-		const client = await makeClient('0.0.0.0', 128)
+	it('clamps a domain too large for the header byte to default 0', async () => {
+		const client = await makeClient('0.0.0.0', 256)
 		expect(eventSocket().addMembership).toHaveBeenCalledWith('224.0.1.129', '0.0.0.0')
 		client.destroy()
 	})
@@ -866,7 +868,9 @@ describe('FIX: delay_req domain byte', () => {
 		client.destroy()
 	})
 
-	it.each([1, 2, 3, 16, 127])('sends delay_req with domain byte %i for domain %i', async (domain) => {
+	// 128 and above are the IEEE 1588-2019 range: every domain shares 224.0.1.129, so the
+	// domain byte of the Delay_Req is the only thing that proves the client took the value
+	it.each([1, 2, 3, 16, 127, 128, 200, 255])('sends delay_req with domain byte %i for domain %i', async (domain) => {
 		const client = await makeClient('0.0.0.0', domain, 125)
 
 		eventSocket().emit('message', makeSyncBuffer({ flags: 0x0200, sequence: 1, domain }), rinfo)
@@ -1192,10 +1196,10 @@ describe('FIX: domain discovery', () => {
 		client.destroy()
 	})
 
-	it('ignores reserved domains above 127', async () => {
+	it('records a domain above 127, which IEEE 1588-2019 permits', async () => {
 		const client = await makeClient()
 		eventSocket().emit('message', makeSyncBuffer({ domain: 200 }), rinfo)
-		expect([...client.domains]).not.toContain(200)
+		expect([...client.domains]).toContain(200)
 		client.destroy()
 	})
 

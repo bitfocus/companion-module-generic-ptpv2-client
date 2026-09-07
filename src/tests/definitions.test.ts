@@ -166,7 +166,7 @@ describe('config field visibility', () => {
 	const field = (id: string) => fields.find((f) => f.id === id)!
 
 	it('hides the PTPv2 settings unless the connection is PTPv2', () => {
-		for (const id of ['domain', 'delayMechanism', 'delayMechanismHelp']) {
+		for (const id of ['domain', 'domainHelp', 'delayMechanism', 'delayMechanismHelp']) {
 			expect(field(id).isVisibleExpression).toContain(`$(options:ptpVersion) == 'v2'`)
 		}
 	})
@@ -191,6 +191,21 @@ describe('config field visibility', () => {
 		// not itself expression-capable
 		expect(field('ptpVersion').disableAutoExpression).toBe(true)
 		expect(field('subdomain').disableAutoExpression).toBe(true)
+		expect(field('domain').disableAutoExpression).toBe(true)
+	})
+
+	it('warns about a 1588-2019 domain only when one is actually selected', () => {
+		// Both halves matter: a stored domain above 127 must not surface the warning on a
+		// PTPv1 connection, where the domain field means nothing
+		const expression = field('domainHelp').isVisibleExpression ?? ''
+		expect(expression).toContain(`$(options:ptpVersion) == 'v2'`)
+		expect(expression).toContain(`$(options:domain) > 127`)
+	})
+
+	it('offers the whole domain byte, not just the 1588-2008 range', () => {
+		const domain = field('domain') as unknown as { min: number; max: number }
+		expect(domain.min).toBe(0)
+		expect(domain.max).toBe(255)
 	})
 
 	it('constrains the custom subdomain to what the protocol can carry', () => {

@@ -1,20 +1,16 @@
-# PTPv2 Client
+# PTP Client
 
-Utility module for monitoring PTPv2 (IEEE 1588-2008 / IEEE 1588-2019) or PTPv1 (IEEE 1588-2002) on a network the Companion instance is connected to. It is a **passive monitor**: it observes the PTP traffic on the selected interface and reports what the grandmaster is advertising. It does **not** discipline the host system clock, and it does not participate in the Best Master Clock Algorithm.
+Utility module for monitoring PTPv1 (IEEE 1588-2002) or PTPv2 (IEEE 1588-2008 / IEEE 1588-2019) on a network the Companion instance is connected to. It is a **passive monitor**: it observes the PTP traffic on the selected interface and reports what the grandmaster is advertising. It does not discipline the host system clock, and it does not participate in the Best Master Clock Algorithm.
 
 For detailed protocol-level diagnostics consider Meinberg's PTP Track Hound.
 
-## Standards support
+## Protocols
 
-Both **IEEE 1588-2008** (PTP v2.0) and **IEEE 1588-2019** (PTP v2.1) masters are supported. The version in use is reported by the `ptpVersion` variable as `2.0` or `2.1`.
+PTPv1 and PTPv2 are incompatible protocols. Operating the module in one mode will give no visibility of traffic for the other protocol.
 
-The two are wire-compatible for everything this module reads. 2019 redefines several fields that 2008 reserved — the upper nibble of byte 1 became `minorVersionPTP`, the upper nibble of byte 0 became `majorSdoId`, and the flag field gained `synchronizationUncertain` — all of which are handled. The module identifies itself as v2.0 in the Delay Requests it sends, which 2019 masters accept.
+### PTPv1 — IEEE 1588-2002 (Dante)
 
-### PTPv1
-
-**PTPv1 and PTPv2 are different protocols** The packet layouts differ, the message type numbering differs, and neither can see the other's traffic.
-
-PTPv1 is what **Dante** uses by default. It has no domain number; it selects a clock domain by a 16-byte **subdomain name** carried in every packet. Dante runs a separate subdomain per pull-up/pull-down rate so that devices at different rates cannot disturb one another. The addresses below are from Audinate's published [PTP IP addresses used by Dante](https://support.getdante.com/hc/en-gb/articles/5508292415903-PTP-IP-addresses-used-by-Dante):
+PTPv1 is what **Dante** uses by default. It selects a clock domain by a 16-byte **subdomain name** carried in every packet. Dante runs a separate subdomain per pull-up/pull-down rate so that devices at different rates cannot disturb one another. The addresses below are from Audinate's published [PTP IP addresses used by Dante](https://support.getdante.com/hc/en-gb/articles/5508292415903-PTP-IP-addresses-used-by-Dante):
 
 | Subdomain | Multicast   | Dante clock configuration |
 | --------- | ----------- | ------------------------- |
@@ -24,9 +20,48 @@ PTPv1 is what **Dante** uses by default. It has no domain number; it selects a c
 | `_ALT3`   | 224.0.1.132 | Pull-up/down −0.1%        |
 | `_ALT4`   | 224.0.1.131 | Pull-up/down −4%          |
 
-Subdomains seen on the wire are recorded even when the connection is not listening to them.
+Subdomains observed are recorded even when the connection is not listening to them.
 
-### Custom subdomains
+PTPv1 reports less than PTPv2, and the module publishes only those variables it can populate.
+
+### PTPv2 — IEEE 1588-2008 / 2019
+
+Both **IEEE 1588-2008** (PTP v2.0) and **IEEE 1588-2019** (PTP v2.1) are supported. The version in use is reported by the `ptpVersion` variable as `2.0` or `2.1`.
+
+The two are wire-compatible for everything this module reads. 2019 redefines several fields that 2008 reserved — the upper nibble of byte 1 became `minorVersionPTP`, the upper nibble of byte 0 became `majorSdoId`, and the flag field gained `synchronizationUncertain` — all of which are handled. The module identifies itself as v2.0 in the Delay Requests it sends, which 2019 masters accept.
+
+## Requirements
+
+### Ports and multicast groups
+
+The module joins the PTP multicast group and binds to UDP ports **319** (event) and **320** (general). Unless the delay mechanism is set to End to End it also joins the peer delay group 224.0.0.107.
+
+### Linux privileges
+
+Both are privileged ports: on Linux the Node.js binary needs permission to bind them — grant `CAP_NET_BIND_SERVICE` with `setcap`, or use `authbind`. Companion installs multiple Node.js binaries, make sure to grant the permissions to the `v26` binary used by modules.
+
+## Configuration
+
+### Settings
+
+| Setting            | Description                                                                                                                                                                                          |
+| ------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| PTP Version        | `PTPv2` (IEEE 1588-2008/2019) or `PTPv1` (IEEE 1588-2002, Dante). Changing this changes which of the settings below apply, and which variables and feedbacks exist.                                  |
+| Interface          | The local IPv4 interface to monitor. This selects which interface joins the multicast group; the sockets themselves bind to all interfaces, which is required to receive multicast traffic.          |
+| Domain             | **PTPv2 only.** PTP domain to monitor, 0–255. Every domain shares the multicast address 224.0.1.129 and is separated by the domain byte in the packet. Above 127 is IEEE 1588-2019 only — see below. |
+| Sync Interval (ms) | How often this module takes a measurement, 125–30000 ms. This is a rate limit on **our own** traffic, not a property of the master, and it does not affect how sync loss is detected.                |
+| Subdomain          | **PTPv1 only.** The subdomain name to listen on. See the table above for which Dante sample rate family each one carries.                                                                            |
+| Delay Mechanism    | **PTPv2 only.** How path delay is established: `Auto`, `End to End`, `Peer to Peer`, or `Passive`. See below. PTPv1 has only the end to end exchange.                                                |
+
+### Domains above 127 (PTPv2)
+
+IEEE 1588-2008 defines domains 0–127 and reserves 128–255. IEEE 1588-2019 revised the domain specification — a domain is identified by `domainNumber` together with `sdoId` — and permits the full 0–255.
+
+The module accepts the whole range, because a domain it cannot select is a domain it cannot monitor. Selecting one above 127 asserts that the network is 1588-2019: a 1588-2008 grandmaster will never send on it, and nothing will be heard. A warning appears in the connection settings when one is selected.
+
+In practice this rarely matters — the common profiles sit well below the boundary. SMPTE ST 2059-2 uses domain 127, AES67 and gPTP use 0.
+
+### Custom subdomains (PTPv1)
 
 **Dante Domain Manager** networks can be given any subdomain name, for example `H~O$L`. Audinate maps such a name onto 224.0.1.130, .131 or .132 by a rule it does not publish, so the group cannot be worked out from the name.
 
@@ -45,24 +80,7 @@ Selecting **Custom…** in the Subdomain dropdown reveals two further settings:
 
 The two failure modes look quite different, which makes them easy to tell apart. **Wrong group:** nothing arrives at all and `subdomainsFound` stays empty. **Wrong name:** the traffic arrives and is discarded, so the connection stays unsynced but the real name is listed in `subdomainsFound` — copy it from there.
 
-PTPv1 reports less than PTPv2, and the module publishes only what it can populate.
-
-## Requirements
-
-The module joins the PTP multicast group and binds to UDP ports **319** (event) and **320** (general). Unless the delay mechanism is set to End to End it also joins the peer delay group 224.0.0.107. Both are privileged ports: on Linux the Node.js binary needs permission to bind them — grant `CAP_NET_BIND_SERVICE` with `setcap`, or use `authbind`. Companion installs multiple Node.js binaries, make sure to grant the permissions to the `v26` binary used by modules.
-
-## Configuration
-
-| Setting            | Description                                                                                                                                                                                 |
-| ------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| PTP Version        | `PTPv2` (IEEE 1588-2008/2019) or `PTPv1` (IEEE 1588-2002, Dante). Changing this changes which of the settings below apply, and which variables and feedbacks exist.                         |
-| Interface          | The local IPv4 interface to monitor. This selects which interface joins the multicast group; the sockets themselves bind to all interfaces, which is required to receive multicast traffic. |
-| Domain             | PTP domain to monitor, 0–127. Every domain shares the multicast address 224.0.1.129 and is separated by the domain byte in the packet.                                                      |
-| Sync Interval (ms) | How often this module takes a measurement, 125–30000 ms. This is a rate limit on **our own** traffic, not a property of the master, and it does not affect how sync loss is detected.       |
-| Subdomain          | **PTPv1 only.** The subdomain name to listen on. See the table above for which Dante sample rate family each one carries.                                                                   |
-| Delay Mechanism    | **PTPv2 only.** How path delay is established: `Auto`, `End to End`, `Peer to Peer`, or `Passive`. See below. PTPv1 has only the end to end exchange.                                       |
-
-## Delay mechanism
+### Delay mechanism (PTPv2)
 
 > Applies to **PTPv2 only**. IEEE 1588-2002 defines only the end to end exchange, so a PTPv1 connection always uses it and the setting is hidden.
 
@@ -77,7 +95,7 @@ A Sync message tells you when the master sent it, not when it arrived. Turning t
 
 The mechanism actually in use is reported by `$(ptp:delayMechanism)` and logged when it is decided.
 
-### Choosing one
+#### Choosing one
 
 If you know what the network runs set it explicitly. Otherwise leave it on **Auto**.
 
@@ -85,13 +103,32 @@ If you know what the network runs set it explicitly. Otherwise leave it on **Aut
 
 That inference is one-sided. Peer delay is **link-local** — sent to 224.0.0.107, which no router forwards — so the only device whose peer delay you can ever hear is the one on the other end of your own cable. On a Peer to Peer network where the switch port you are plugged into is not itself a peer delay responder, there is nothing to hear, and Auto will wrongly settle on End to End. **If a Peer to Peer network reports no PTP time, set the mechanism to Peer to Peer or Passive explicitly.**
 
-### Peer to Peer without a responding neighbour
+## Understanding the output
 
-A neighbour that does not answer `Pdelay_Req` is not a failure. The module still syncs, using the `correctionField` exactly as Passive does, and simply leaves the local link unaccounted for — the reported time is then behind by one link delay, normally well under a microsecond on copper. `$(ptp:peerDelayResponding)` reports whether the neighbour is answering, and the condition is logged once as a warning.
+### Master versus grandmaster
 
-Note that `$(ptp:peerMeanPathDelay)` is the delay of **your own link only**, not the distance to the grandmaster. In a Peer to Peer network there is no single figure for the latter — that is precisely what the `correctionField` accumulates on the way.
+- **PTP Master** is the port that sent the Sync message, shown as `clock-identity:portNumber`. Behind a boundary clock this is the boundary clock, not the source of time.
+- **Grandmaster** is the actual source of time, taken from Announce messages. **Steps Removed** gives the number of boundary clocks between this host and it — `0` means the grandmaster is being heard directly.
 
-## How synchronisation is measured
+### Identifying a device beyond its clock identity
+
+**MAC address.** A PTPv2 clock identity is usually an EUI-64 derived from the device's MAC by inserting `FF:FE` in the middle (IEEE 1588 §7.5.2.2.2), so the MAC can be recovered from it. Identity `00:1b:19:ff:fe:12:34:56` gives MAC `00:1b:19:12:34:56`. Where a device uses a configured or randomly generated identity there is no `FF:FE` marker and no MAC to recover, and the variable is left empty.
+
+In **PTPv1** there is nothing to recover: a `sourceUuid` is an EUI-48 outright (IEEE 1588-2002 §6.2.2.5), so `ptpMasterMac` is always populated once a Sync has been heard.
+
+**Manufacturer.** The first three bytes are the manufacturer's IEEE-assigned block, reported as hex in `grandmasterOui`, and resolved to a name in `grandmasterVendor` where the block is one the module carries.
+
+The bundled table is built from the IEEE public registries (MA-L, MA-M and MA-S), filtered to the vendors plausible on a broadcast, AV, audio, network or data centre PTP network.
+
+An OUI alone is often not enough to name a maker. IEEE subdivides some 24-bit blocks into 28-bit (MA-M) and 36-bit (MA-S) assignments, and many professional audio and broadcast vendors hold only one of those — the 24-bit block is then registered to the IEEE Registration Authority rather than to anyone you could name. The lookup is therefore given the whole MAC and matches the longest assignment first. A master at `18:66:96:11:0b:52` resolves to _Turtle AV_ through the 28-bit block `1866961`; its OUI `186696` on its own belongs to no vendor at all.
+
+**Path trace.** Where the grandmaster emits a `PATH_TRACE` TLV (IEEE 1588-2019 §16.2), the Announce carries the clock identity of every clock it passed through, grandmaster first and the transmitting clock last. This gives the exact chain of boundary clocks between the source of time and this host, which `Steps Removed` only counts. Path trace is optional and disabled by default on many grandmasters, so `pathTrace` is often empty; when it is, `Steps Removed` remains the best available measure of distance.
+
+A clock identity appearing twice in the chain means the Announce travelled a loop, which `pathTraceLoop` reports and the _Path Trace Loop Detected_ feedback flags.
+
+**IP address.** PTP carries no field for the grandmaster's address. All that is ever available is the source address of the packet that arrived, which is the grandmaster only when it sent the Announce itself. `grandmasterAddress` is therefore populated only when **Steps Removed is 0**, and is empty otherwise; behind a boundary clock the address you can see belongs to that boundary clock and is reported as `ptpMasterAddress`.
+
+### How synchronisation is measured
 
 From the timestamps of an exchange the module derives:
 
@@ -102,7 +139,7 @@ The `correctionField` of every Sync, Follow_Up and Delay_Response is applied, so
 
 Each Delay Response and Pdelay Response is matched against this client's own clock identity, so responses addressed to other slaves on the network are ignored. A peer delay measurement that comes out negative, or larger than 100 ms, is discarded rather than folded into the offset.
 
-## Loss of sync
+### Loss of sync
 
 Sync loss follows the receipt timeouts defined by IEEE 1588-2008 §7.7.3.1. A timeout is a multiple of the interval the master advertises in its `logMessageInterval` field, so a master sending 8 Sync messages per second is declared lost far sooner than one sending every 2 seconds.
 
@@ -115,24 +152,17 @@ Both multipliers are 3, the IEEE 1588 default for `announceReceiptTimeout` (the 
 
 Until a master has been heard from, the defaults are a 1 second Sync interval and a 2 second Announce interval. An advertised interval is clamped to between ~7.8 ms and 16 seconds so that a malformed value cannot produce an unusable timer.
 
-## Master versus grandmaster
+## Troubleshooting
 
-- **PTP Master** is the port that sent the Sync message, shown as `clock-identity:portNumber`. Behind a boundary clock this is the boundary clock, not the source of time.
-- **Grandmaster** is the actual source of time, taken from Announce messages. **Steps Removed** gives the number of boundary clocks between this host and it — `0` means the grandmaster is being heard directly.
+### Peer to peer with no responding neighbour
 
-### Identifying a device beyond its clock identity
+A neighbour that does not answer `Pdelay_Req` is not a failure. The module still syncs, using the `correctionField` exactly as Passive does, and simply leaves the local link unaccounted for — the reported time is then behind by one link delay, normally well under a microsecond on copper. `$(ptp:peerDelayResponding)` reports whether the neighbour is answering, and the condition is logged once as a warning.
 
-**MAC address.** A clock identity is usually an EUI-64 derived from the device's MAC by inserting `FF:FE` in the middle (IEEE 1588 §7.5.2.2.2), so the MAC can be recovered from it. Identity `00:1b:19:ff:fe:12:34:56` gives MAC `00:1b:19:12:34:56`. Where a device uses a configured or randomly generated identity there is no `FF:FE` marker and no MAC to recover, and the variable is left empty.
+Note that `$(ptp:peerMeanPathDelay)` is the delay of **your own link only**, not the distance to the grandmaster. In a Peer to Peer network there is no single figure for the latter — that is precisely what the `correctionField` accumulates on the way.
 
-**Manufacturer.** The first three bytes are the manufacturer's IEEE-assigned block, reported as hex in `grandmasterOui`, and resolved to a name in `grandmasterVendor` where the block is one the module carries.
+### The manufacturer is empty
 
-The bundled table is filtered from the public OUI Master Database to the vendors plausible on a broadcast, AV, audio, network or data centre PTP network.
-
-**Path trace.** Where the grandmaster emits a `PATH_TRACE` TLV (IEEE 1588-2019 §16.2), the Announce carries the clock identity of every clock it passed through, grandmaster first and the transmitting clock last. This gives the exact chain of boundary clocks between the source of time and this host, which `Steps Removed` only counts. Path trace is optional and disabled by default on many grandmasters, so `pathTrace` is often empty; when it is, `Steps Removed` remains the best available measure of distance.
-
-A clock identity appearing twice in the chain means the Announce travelled a loop, which `pathTraceLoop` reports and the _Path Trace Loop Detected_ feedback flags.
-
-**IP address.** PTP carries no field for the grandmaster's address. All that is ever available is the source address of the packet that arrived, which is the grandmaster only when it sent the Announce itself. `grandmasterAddress` is therefore populated only when **Steps Removed is 0**, and is empty otherwise; behind a boundary clock the address you can see belongs to that boundary clock and is reported as `ptpMasterAddress`.
+Not every device can be named, and on a Dante network many cannot. A large share of Dante-enabled brands hold no IEEE assignment of their own — their hardware carries the MAC of the audio module or the contract manufacturer that built it, not of the brand on the front panel. Where that is so, no OUI table can identify the brand, and `ptpMasterVendor` remains+ empty.
 
 ## Feedbacks
 
@@ -178,14 +208,14 @@ The PTP Time variables are a snapshot taken at each sync event, not a live clock
 
 ### Master
 
-| Variable                  | Type     | Description                                                                                    |
-| ------------------------- | -------- | ---------------------------------------------------------------------------------------------- |
-| `$(ptp:ptpMaster)`        | `string` | Clock identity and port number of the port sending Sync.                                       |
-| `$(ptp:ptpMasterAddress)` | `string` | Source IP address of that port.                                                                |
-| `$(ptp:ptpMasterMac)`     | `string` | MAC of that port, recovered from its clock identity. Empty if the identity is not MAC-derived. |
-| `$(ptp:ptpMasterOui)`     | `string` | Manufacturer's IEEE-assigned block for that port, as hex.                                      |
-| `$(ptp:ptpMasterVendor)`  | `string` | Manufacturer of that port, where its IEEE block is one the module carries.                     |
-| `$(ptp:ptpVersion)`       | `string` | PTP version in use: `2.0` for IEEE 1588-2008, `2.1` for IEEE 1588-2019.                        |
+| Variable                  | Type     | Description                                                                                                                                                                              |
+| ------------------------- | -------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `$(ptp:ptpMaster)`        | `string` | Clock identity and port number of the port sending Sync.                                                                                                                                 |
+| `$(ptp:ptpMasterAddress)` | `string` | Source IP address of that port.                                                                                                                                                          |
+| `$(ptp:ptpMasterMac)`     | `string` | MAC of that port. Recovered from the clock identity in PTPv2, and empty if that identity is not MAC-derived; read directly from the `sourceUuid` in PTPv1, where it is always available. |
+| `$(ptp:ptpMasterOui)`     | `string` | Manufacturer's IEEE-assigned block for that port, as hex.                                                                                                                                |
+| `$(ptp:ptpMasterVendor)`  | `string` | Manufacturer of that port, where its IEEE block is one the module carries.                                                                                                               |
+| `$(ptp:ptpVersion)`       | `string` | PTP version in use: `2.0` for IEEE 1588-2008, `2.1` for IEEE 1588-2019.                                                                                                                  |
 
 ### Grandmaster
 

@@ -116,13 +116,9 @@ export default class ModuleInstance extends InstanceBase<ModuleSchema> {
 			this.log('info', `PTPv2 Master Changed: ${ptp_master} Address: ${master_address}`)
 			this.log(sync ? 'info' : 'warn', `PTP Sync Changed. ${sync ? 'Locked' : 'Unlocked'}`)
 			this.checkAllFeedbacks()
-			this.setVariableValues({
-				ptpMaster: ptp_master,
-				ptpMasterAddress: master_address,
-				ptpMasterMac: this.v2?.ptp_master_mac ?? '',
-				ptpMasterOui: this.v2?.ptp_master_oui ?? '',
-				ptpMasterVendor: this.v2?.ptp_master_vendor ?? '',
-			})
+			// A new master invalidates the time derived from the old one, which sharedValues
+			// reports as unset until the next exchange completes
+			this.setVariableValues(this.sharedValues())
 		})
 		client.on('ptp_time_synced', (time, lastSync) => {
 			const syncTime = new Date(lastSync)
@@ -221,7 +217,7 @@ export default class ModuleInstance extends InstanceBase<ModuleSchema> {
 			this.log('info', `PTPv1 Master Changed: ${ptp_master} Address: ${master_address}`)
 			this.log(sync ? 'info' : 'warn', `PTP Sync Changed. ${sync ? 'Locked' : 'Unlocked'}`)
 			this.checkAllFeedbacks()
-			this.setVariableValues({ ptpMaster: ptp_master, ptpMasterAddress: master_address })
+			this.setVariableValues(this.sharedValues())
 		})
 		client.on('ptp_time_synced', (time, lastSync) => {
 			const syncTime = new Date(lastSync)
@@ -307,6 +303,11 @@ export default class ModuleInstance extends InstanceBase<ModuleSchema> {
 			lastSync: unsynced ? '' : new Date(this.client.last_sync).toISOString(),
 			ptpMaster: ptp_master[0],
 			ptpMasterAddress: ptp_master[1],
+			// Both protocols identify the sending port by an EUI-48 — PTPv1 carries it as the
+			// sourceUuid directly, PTPv2 inside the clockIdentity — so both can name the maker
+			ptpMasterMac: this.client.ptp_master_mac ?? '',
+			ptpMasterOui: this.client.ptp_master_oui,
+			ptpMasterVendor: this.client.ptp_master_vendor ?? '',
 		}
 	}
 
@@ -327,9 +328,6 @@ export default class ModuleInstance extends InstanceBase<ModuleSchema> {
 		if (!v2) return
 		this.setVariableValues({
 			...this.sharedValues(),
-			ptpMasterMac: v2.ptp_master_mac ?? '',
-			ptpMasterOui: v2.ptp_master_oui,
-			ptpMasterVendor: v2.ptp_master_vendor ?? '',
 			ptpVersion: v2.ptp_version,
 			delayMechanism: v2.delay_mechanism_label,
 			peerDelayResponding: v2.peer_responding,

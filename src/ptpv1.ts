@@ -3,6 +3,7 @@ import { EventEmitter } from 'events'
 import { isIPv4 } from 'net'
 import { networkInterfaces } from 'os'
 import { randomBytes } from 'crypto'
+import { lookupOui } from './oui.js'
 
 export type PtpTime = [number, number]
 
@@ -262,6 +263,30 @@ const formatSourceId = (buffer: Buffer): string => {
 	return uuidBytes.join('-') + ':' + portId
 }
 
+/**
+ * The MAC of a PTPv1 source, as "aa:bb:cc:dd:ee:ff".
+ *
+ * PTPv1 needs no recovery step to get here. A sourceUuid *is* an EUI-48 (IEEE 1588-2002
+ * §6.2.2.5), where the PTPv2 clockIdentity it became is an EUI-64 with FF FE inserted in the
+ * middle — so a v2 identity may turn out to have no MAC behind it at all, and a v1 one
+ * always does.
+ */
+const macFromUuid = (uuid: Buffer): string => [...uuid].map((byte) => byte.toString(16).padStart(2, '0')).join(':')
+
+/** The manufacturer's IEEE-assigned block, as hex. Not a name: see {@link vendorFromUuid}. */
+const ouiFromUuid = (uuid: Buffer): string =>
+	[...uuid.subarray(0, 3)].map((byte) => byte.toString(16).padStart(2, '0')).join(':')
+
+/**
+ * The manufacturer behind a sourceUuid, where its block is one the table carries.
+ *
+ * The whole MAC is offered rather than the 3 byte OUI, because many professional audio and
+ * broadcast makers hold only a 28 or 36 bit assignment that a 24 bit prefix cannot match.
+ * Undefined rather than a guess when the block is unknown: a wrong name in front of an
+ * engineer is worse than no name.
+ */
+const vendorFromUuid = (uuid: Buffer): string | undefined => lookupOui(uuid.toString('hex'))
+
 // ---------------------------------------------------------------------------
 // Events
 // ---------------------------------------------------------------------------
@@ -306,6 +331,9 @@ export class PTPv1Client extends EventEmitter<PTPv1ClientEvents> {
 	private syncTimeout: NodeJS.Timeout | undefined = undefined
 	private ptpMaster: string = ''
 	private ptpMasterAddress: string = ''
+	// The master's raw sourceUuid. Kept alongside the formatted identity because it is an
+	// EUI-48, and so answers for the MAC, OUI and manufacturer without further work.
+	private ptpMasterUuid: Buffer | undefined = undefined
 	private minSyncInterval: number = 10000
 	private subdomainsFound: Set<string> = new Set<string>()
 	private destroyed: boolean = false
@@ -439,6 +467,8 @@ export class PTPv1Client extends EventEmitter<PTPv1ClientEvents> {
 			if (source !== this.ptpMaster) {
 				this.ptpMaster = source
 				this.ptpMasterAddress = rinfo.address
+				// Copied, not referenced: dgram reuses its receive buffer for the next datagram
+				this.ptpMasterUuid = Buffer.from(buffer.subarray(SOURCE_UUID_OFFSET, SOURCE_UUID_OFFSET + SOURCE_UUID_LENGTH))
 				this.sync_change(false)
 				this.emit('ptp_master_changed', this.ptpMaster, rinfo.address, this.sync)
 			}
@@ -553,6 +583,24 @@ export class PTPv1Client extends EventEmitter<PTPv1ClientEvents> {
 	 */
 	public get ptp_master(): [string, string] {
 		return [this.ptpMaster, this.ptpMasterAddress]
+	}
+
+	/**
+	 * MAC of the port sending Sync. Unlike PTPv2 this is never a recovery that can fail — a
+	 * PTPv1 sourceUuid is the EUI-48 itself.
+	 */
+	public get ptp_master_mac(): string | undefined {
+		return this.ptpMasterUuid ? macFromUuid(this.ptpMasterUuid) : undefined
+	}
+
+	/** OUI of the port sending Sync */
+	public get ptp_master_oui(): string {
+		return this.ptpMasterUuid ? ouiFromUuid(this.ptpMasterUuid) : ''
+	}
+
+	/** Manufacturer of the port sending Sync, where its block is one we carry */
+	public get ptp_master_vendor(): string | undefined {
+		return this.ptpMasterUuid ? vendorFromUuid(this.ptpMasterUuid) : undefined
 	}
 
 	/** Timestamp (Date.now()) of the most recent completed sync exchange. */

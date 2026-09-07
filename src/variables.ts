@@ -77,6 +77,9 @@ const sharedDefs: VariableDefs = {
 
 	ptpMaster: { name: 'PTP Master (Clock Identity)' },
 	ptpMasterAddress: { name: 'PTP Master (Address)' },
+	ptpMasterMac: { name: 'PTP Master (MAC)' },
+	ptpMasterOui: { name: 'PTP Master (OUI)' },
+	ptpMasterVendor: { name: 'PTP Master (Manufacturer)' },
 	ptpVersion: { name: 'PTP Version' },
 }
 
@@ -85,6 +88,9 @@ const sharedDefs: VariableDefs = {
  * a PTPv1 clock advertises itself inside the Sync body instead, and the PTPv1 client does not
  * yet read it. The delay figures are equally absent: PTPv1 has no peer delay mechanism, and
  * the PTPv1 client does not derive a path delay from its exchange.
+ *
+ * The master's MAC, OUI and manufacturer are *not* here: both protocols carry an EUI-48 in
+ * the identity of the port sending Sync, so both can report them.
  */
 const v2Defs: VariableDefs = {
 	meanPathDelay: { name: 'Mean Path Delay (ns)' },
@@ -92,10 +98,6 @@ const v2Defs: VariableDefs = {
 	peerMeanPathDelay: { name: 'Peer Mean Path Delay (ns)' },
 	peerDelayResponding: { name: 'Peer Delay Responding' },
 	lastCorrection: { name: 'Last Clock Correction (ns)' },
-
-	ptpMasterMac: { name: 'PTP Master (MAC)' },
-	ptpMasterOui: { name: 'PTP Master (OUI)' },
-	ptpMasterVendor: { name: 'PTP Master (Manufacturer)' },
 
 	grandmaster: { name: 'Grandmaster (Clock Identity)' },
 	grandmasterMac: { name: 'Grandmaster (MAC)' },

@@ -48,6 +48,10 @@ describe('variable definitions by protocol', () => {
 		'lastSync',
 		'ptpMaster',
 		'ptpMasterAddress',
+		// Both protocols identify the sending port by an EUI-48, so both can name its maker
+		'ptpMasterMac',
+		'ptpMasterOui',
+		'ptpMasterVendor',
 		'ptpVersion',
 	]
 

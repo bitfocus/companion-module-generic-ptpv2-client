@@ -2165,6 +2165,9 @@ describe('OUI table', () => {
 		expect(lookupOui('000B72112233')).toContain('Lawo')
 		expect(lookupOui('00077D112233')).toContain('Cisco')
 		expect(lookupOui('0050C2226001')).toContain('Ross Video')
+		// A 28 bit MA-M assignment: 186696 alone is an IEEE-subdivided block owned by nobody
+		expect(lookupOui('186696110B52')).toContain('Turtle AV')
+		expect(lookupOui('186696')).toBeUndefined()
 	})
 
 	it('tolerates separators and lower case', async () => {

@@ -771,6 +771,72 @@ describe('PTPv1 timestamps and offset', () => {
 })
 
 // ===========================================================================
+// Master identity
+// ===========================================================================
+/**
+ * A PTPv1 sourceUuid is an EUI-48 outright, so the MAC needs no recovering — where PTPv2
+ * has to reverse the FF FE expansion of a clockIdentity and may find there was no MAC
+ * behind it at all, v1 simply reads the six bytes.
+ */
+describe('PTPv1 master identity', () => {
+	it('reports the MAC and OUI straight from the sourceUuid', async () => {
+		const client = await makeClient()
+		eventSocket().emit('message', makeSync({ uuid: '186696110b52' }), rinfo)
+		expect(client.ptp_master_mac).toBe('18:66:96:11:0b:52')
+		expect(client.ptp_master_oui).toBe('18:66:96')
+		client.destroy()
+	})
+
+	it('names a manufacturer holding only a 28 bit assignment', async () => {
+		// 186696 is an MA-L block IEEE has subdivided, so it belongs to the registry rather
+		// than to a vendor. Only the 28 bit prefix identifies anyone, which is the whole
+		// reason the lookup is offered the full MAC instead of the 3 byte OUI.
+		const client = await makeClient()
+		eventSocket().emit('message', makeSync({ uuid: '186696110b52' }), rinfo)
+		expect(client.ptp_master_vendor).toBe('Turtle AV')
+		client.destroy()
+	})
+
+	it('leaves the manufacturer unset for a block the table does not carry', async () => {
+		// A wrong name in front of an engineer is worse than no name
+		const client = await makeClient()
+		eventSocket().emit('message', makeSync({ uuid: 'aabbccddeeff' }), rinfo)
+		expect(client.ptp_master_mac).toBe('aa:bb:cc:dd:ee:ff')
+		expect(client.ptp_master_vendor).toBeUndefined()
+		client.destroy()
+	})
+
+	it('has no identity before a Sync has been heard', async () => {
+		const client = await makeClient()
+		expect(client.ptp_master_mac).toBeUndefined()
+		expect(client.ptp_master_oui).toBe('')
+		expect(client.ptp_master_vendor).toBeUndefined()
+		client.destroy()
+	})
+
+	it('follows the master when it changes', async () => {
+		const client = await makeClient()
+		eventSocket().emit('message', makeSync({ uuid: 'aabbccddeeff' }), rinfo)
+		eventSocket().emit('message', makeSync({ uuid: '186696110b52' }), rinfo)
+		expect(client.ptp_master_mac).toBe('18:66:96:11:0b:52')
+		expect(client.ptp_master_vendor).toBe('Turtle AV')
+		client.destroy()
+	})
+
+	it('keeps the identity of the master, not of the last packet seen', async () => {
+		// dgram hands the same receive buffer to the next datagram, so the uuid has to be
+		// copied out rather than referenced
+		const client = await makeClient()
+		eventSocket().emit('message', makeSync({ uuid: '186696110b52' }), rinfo)
+		// A second Sync from the same master, and a Delay_Req from a different clock
+		eventSocket().emit('message', makeSync({ uuid: '186696110b52', sequence: 2 }), rinfo)
+		eventSocket().emit('message', makePacket({ control: CTRL_DELAY_REQ, uuid: 'ffeeddccbbaa' }), rinfo)
+		expect(client.ptp_master_mac).toBe('18:66:96:11:0b:52')
+		client.destroy()
+	})
+})
+
+// ===========================================================================
 // Message identification
 // ===========================================================================
 /**

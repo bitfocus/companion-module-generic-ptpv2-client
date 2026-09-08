@@ -870,7 +870,7 @@ describe('FIX: delay_req domain byte', () => {
 
 	// 128 and above are the IEEE 1588-2019 range: every domain shares 224.0.1.129, so the
 	// domain byte of the Delay_Req is the only thing that proves the client took the value
-	it.each([1, 2, 3, 16, 127, 128, 200, 255])('sends delay_req with domain byte %i for domain %i', async (domain) => {
+	it.each([1, 2, 3, 16, 127, 128, 200, 255])('sends delay_req with domain byte %i', async (domain) => {
 		const client = await makeClient('0.0.0.0', domain, 125)
 
 		eventSocket().emit('message', makeSyncBuffer({ flags: 0x0200, sequence: 1, domain }), rinfo)
@@ -1242,6 +1242,20 @@ const withCorrection = (buf: Buffer, nanoseconds: number): Buffer => {
 }
 
 describe('correctionField', () => {
+	// Two of the four timestamps in the offset are this client's own clock, so every result
+	// otherwise carries the real time elapsed between receiving the Sync and reading
+	// ptp_time. Freezing hrtime removes that term — it cancels out of the arithmetic
+	// entirely — and the formula can be asserted outright rather than bounded.
+	//
+	// Only hrtime is faked. dueForExchange() gates on Date.now(), and the exchange is driven
+	// through setImmediate, so both are left real.
+	beforeEach(() => {
+		vi.useFakeTimers({ toFake: ['hrtime'] })
+	})
+	afterEach(() => {
+		vi.useRealTimers()
+	})
+
 	/**
 	 * Residence time accumulated by transparent clocks lives in correctionField, not in the
 	 * timestamps. Two runs with identical timestamps but different corrections must produce
@@ -1267,26 +1281,21 @@ describe('correctionField', () => {
 	}
 
 	// A correction on one direction of the exchange moves the offset by *half* its value,
-	// since offset = ((t2 - t1) - (t4 - t3)) / 2. 5ms is used so the signal (2.5ms) is far
-	// larger than the few microseconds of hrtime jitter between two separate runs.
+	// since offset = ((t2 - t1) - (t4 - t3)) / 2. With the clock frozen these come out exact,
+	// so 5ms is chosen as a plausible residence time rather than for signal to noise.
 	const CORRECTION = 5_000_000
 	const HALF = BigInt(CORRECTION / 2)
-	const TOLERANCE = 500_000n
 
 	it('a Sync correction advances t1 and so advances ptp_time by half of it', async () => {
 		const none = await offsetFor(0, 0)
 		const corrected = await offsetFor(CORRECTION, 0)
-		const shift = corrected - none
-		expect(shift).toBeGreaterThan(HALF - TOLERANCE)
-		expect(shift).toBeLessThan(HALF + TOLERANCE)
+		expect(corrected - none).toBe(HALF)
 	})
 
 	it('a Delay_Resp correction retards t4 and so retards ptp_time by half of it', async () => {
 		const none = await offsetFor(0, 0)
 		const corrected = await offsetFor(0, CORRECTION)
-		const shift = none - corrected
-		expect(shift).toBeGreaterThan(HALF - TOLERANCE)
-		expect(shift).toBeLessThan(HALF + TOLERANCE)
+		expect(none - corrected).toBe(HALF)
 	})
 
 	it('corrections on both directions cancel in the offset but not in the path delay', async () => {
@@ -1304,10 +1313,9 @@ describe('correctionField', () => {
 			rinfo,
 		)
 		// Residence time is real transit time, so it comes out of the measured path delay.
-		// The upper bound matters: getting the sign of one term wrong also produces a very
-		// negative number, but one about 12 orders of magnitude too large.
-		expect(client.mean_path_delay).toBeLessThan(-BigInt(CORRECTION) + TOLERANCE)
-		expect(client.mean_path_delay).toBeGreaterThan(-BigInt(CORRECTION) - TOLERANCE)
+		// The magnitude matters as much as the sign: getting the sign of one term wrong also
+		// produces a negative number, but one about 12 orders of magnitude too large.
+		expect(client.mean_path_delay).toBe(-BigInt(CORRECTION))
 		client.destroy()
 	})
 
@@ -1331,18 +1339,14 @@ describe('correctionField', () => {
 	it('applies the Follow_Up correction in two-step', async () => {
 		const none = await twoStepOffsetFor(0, 0)
 		const corrected = await twoStepOffsetFor(0, CORRECTION)
-		const shift = corrected - none
-		expect(shift).toBeGreaterThan(HALF - TOLERANCE)
-		expect(shift).toBeLessThan(HALF + TOLERANCE)
+		expect(corrected - none).toBe(HALF)
 	})
 
 	it('sums the Sync and Follow_Up corrections, since both are on the master to slave path', async () => {
 		const none = await twoStepOffsetFor(0, 0)
 		const both = await twoStepOffsetFor(CORRECTION, CORRECTION)
-		const shift = both - none
 		// two corrections of CORRECTION each, halved -> a full CORRECTION of shift
-		expect(shift).toBeGreaterThan(BigInt(CORRECTION) - TOLERANCE)
-		expect(shift).toBeLessThan(BigInt(CORRECTION) + TOLERANCE)
+		expect(both - none).toBe(BigInt(CORRECTION))
 	})
 })
 
@@ -1600,6 +1604,17 @@ describe('flag scoping', () => {
 // last_correction bootstrap
 // ===========================================================================
 describe('last_correction', () => {
+	// The drift reported by the second exchange is the local clock's movement since the
+	// first, so with hrtime and Date driven by the fake timer it is exactly the interval
+	// advanced — no real sleep, and no bound to guess at. Date is faked because
+	// dueForExchange() gates the second Delay_Req on it.
+	beforeEach(() => {
+		vi.useFakeTimers({ toFake: ['hrtime', 'Date', 'setTimeout', 'clearTimeout'] })
+	})
+	afterEach(() => {
+		vi.useRealTimers()
+	})
+
 	const exchange = async (client: Awaited<ReturnType<typeof makeClient>>, seq: number) => {
 		eventSocket().emit('message', makeSyncBuffer({ flags: 0x0000, sequence: seq, tsSecondsLow: 1_700_000_000 }), rinfo)
 		await new Promise<void>((r) => setImmediate(r))
@@ -1617,13 +1632,15 @@ describe('last_correction', () => {
 	})
 
 	it('reports a real drift figure once acquired', async () => {
+		const DRIFT_MS = 150
 		const client = await makeClient('0.0.0.0', 0, 125)
 		await exchange(client, 1)
-		await new Promise<void>((r) => setTimeout(r, 150))
+		await vi.advanceTimersByTimeAsync(DRIFT_MS)
 		await exchange(client, 2)
-		// second exchange works from an acquired offset, so the correction is small
-		expect(client.last_correction).toBeLessThan(1_000_000_000n)
-		expect(client.last_correction).toBeGreaterThan(-1_000_000_000n)
+		// The second exchange works from an acquired offset, so what it reports is drift
+		// rather than acquisition: the master's timestamps have not moved, so the whole of
+		// the local clock's advance shows up as the correction.
+		expect(client.last_correction).toBe(BigInt(DRIFT_MS) * 1_000_000n)
 		client.destroy()
 	})
 })

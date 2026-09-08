@@ -44,14 +44,15 @@ Both are privileged ports: on Linux the Node.js binary needs permission to bind 
 
 ### Settings
 
-| Setting            | Description                                                                                                                                                                                          |
-| ------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| PTP Version        | `PTPv2` (IEEE 1588-2008/2019) or `PTPv1` (IEEE 1588-2002, Dante). Changing this changes which of the settings below apply, and which variables and feedbacks exist.                                  |
-| Interface          | The local IPv4 interface to monitor. This selects which interface joins the multicast group; the sockets themselves bind to all interfaces, which is required to receive multicast traffic.          |
-| Domain             | **PTPv2 only.** PTP domain to monitor, 0–255. Every domain shares the multicast address 224.0.1.129 and is separated by the domain byte in the packet. Above 127 is IEEE 1588-2019 only — see below. |
-| Sync Interval (ms) | How often this module takes a measurement, 125–30000 ms. This is a rate limit on **our own** traffic, not a property of the master, and it does not affect how sync loss is detected.                |
-| Subdomain          | **PTPv1 only.** The subdomain name to listen on. See the table above for which Dante sample rate family each one carries.                                                                            |
-| Delay Mechanism    | **PTPv2 only.** How path delay is established: `Auto`, `End to End`, `Peer to Peer`, or `Passive`. See below. PTPv1 has only the end to end exchange.                                                |
+| Setting                | Description                                                                                                                                                                                          |
+| ---------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| PTP Version            | `PTPv2` (IEEE 1588-2008/2019) or `PTPv1` (IEEE 1588-2002, Dante). Changing this changes which of the settings below apply, and which variables and feedbacks exist.                                  |
+| Interface              | The local IPv4 interface to monitor. This selects which interface joins the multicast group; the sockets themselves bind to all interfaces, which is required to receive multicast traffic.          |
+| Domain                 | **PTPv2 only.** PTP domain to monitor, 0–255. Every domain shares the multicast address 224.0.1.129 and is separated by the domain byte in the packet. Above 127 is IEEE 1588-2019 only — see below. |
+| Unicast Delay Requests | Send `Delay_Req` straight to the master rather than to the multicast group, so it is not delivered to every other device. See below.                                                                 |
+| Sync Interval (ms)     | How often this module takes a measurement, 125–30000 ms. This is a rate limit on **our own** traffic, not a property of the master, and it does not affect how sync loss is detected.                |
+| Subdomain              | **PTPv1 only.** The subdomain name to listen on. See the table above for which Dante sample rate family each one carries.                                                                            |
+| Delay Mechanism        | **PTPv2 only.** How path delay is established: `Auto`, `End to End`, `Peer to Peer`, or `Passive`. See below. PTPv1 has only the end to end exchange.                                                |
 
 ### Domains above 127 (PTPv2)
 
@@ -109,6 +110,52 @@ That inference is one-sided. Peer delay is **link-local** — sent to 224.0.0.10
 
 - **PTP Master** is the port that sent the Sync message, shown as `clock-identity:portNumber`. Behind a boundary clock this is the boundary clock, not the source of time.
 - **Grandmaster** is the actual source of time, taken from Announce messages. **Steps Removed** gives the number of boundary clocks between this host and it — `0` means the grandmaster is being heard directly.
+
+### Path delay steps
+
+A route change, or a path that becomes asymmetric, moves the measured delay to a different plateau. That is an event rather than a state — afterwards there is no threshold it sits above or below — so it is logged at warning level rather than offered as a feedback. `$(ptp:meanPathDelay)` continues to report the value itself.
+
+A move is reported when the median of the last 8 measurements changes by **more than half**, **and** by at least **1 ms**. The median is what makes it a step rather than an outlier: one wild measurement cannot move it, eight consistent ones will. Reports are held to one every 30 seconds, and the window has to settle on a single value before it counts, so a move is named by its two plateaus rather than by some value in between.
+
+The 1 ms floor is a limit of this module rather than of PTP. Timestamps here are taken in userspace, so two of the four terms behind a path delay carry whatever scheduling delay the host added — measured at a median of 35 µs and a maximum of 545 µs on an idle machine, and worse on a busy one. **A path delay step smaller than 1 ms is therefore not detectable here.** Seeing one needs hardware timestamping. The same caveat applies to the _Mean Path Delay Above_ feedback: on a quiet LAN the absolute figure carries tens of microseconds of this host's own overhead.
+
+### When the master does not answer
+
+The end to end exchange needs the master to answer a Delay_Req. If it never does, the clock never locks, and nothing else says why — there is no error and no timeout, just a connection that stays unsynced.
+
+After three unanswered requests `$(ptp:delayResponding)` goes false and the condition is logged as a warning. Three, rather than one, so a single dropped packet does not raise it; requests are already paced by the Sync Interval setting, so this is a count rather than a timer.
+
+Peer to peer has always reported the equivalent through `$(ptp:peerDelayResponding)`; this is its end to end counterpart. Passive never transmits, so nothing is outstanding and the variable stays true.
+
+### Unicast Delay Requests
+
+By default a Delay_Req goes to the multicast group, which means every device on the network receives this module's requests. Enabling **Unicast Delay Requests** sends them straight to the master instead, and the master answers the same way. Dante offers the same setting per device and Audinate recommends it on larger networks, for the same reason.
+
+`$(ptp:delayReqDestination)` reports where requests are actually going. Multicast is used until the first Sync arrives, because until then there is no master address to send to.
+
+It is also a diagnostic. If multicast requests go unanswered but unicast ones succeed, the master is fine and the group is being filtered somewhere in between — a different fault, and a different fix, from a master that is ignoring the module.
+
+### Measuring what arrives
+
+A master advertises how often it intends to send Sync. `$(ptp:syncRate)` reports how often one actually arrives, and the two are not the same number when packets are being dropped.
+
+Loss is counted from the sequence number every Sync carries. A hole in the numbering is the only evidence a passive observer has that a message was sent at all, so `$(ptp:syncLossPercent)` and `$(ptp:syncLost)` count what the master sent and this host never saw. A repeat, a message that arrives out of order, and a jump too large to be anything but a master restart are all excluded rather than counted as loss.
+
+This is worth watching because nothing else reveals it. Moderate loss leaves sync up and the offset plausible, and only shows as a slightly noisier correction — but it is the condition that lets a PTP domain split in the first place. Both protocols report it. The count restarts whenever the master changes, since sequence numbers are per port and mean nothing across two clocks.
+
+### When two clocks both claim to be master
+
+A PTP domain is meant to have one grandmaster. Two clocks sending Sync on the same domain — or, in PTPv1, the same subdomain — means it has **split**: each side of the network has run its own election and neither can see the other's result. The usual cause is multicast being dropped somewhere between them, so it shows up on links between sites far more often than within one.
+
+The module handles this in two parts.
+
+**It follows exactly one master.** The first clock heard sending Sync is the one used, and it keeps being used while it keeps transmitting. A second clock is recorded but nothing it sends is allowed near the measurement — not its timestamps, not the sequence numbers a Follow_Up is matched against, not its advertised interval. Without that a split domain produces no usable time at all: each Sync from the other side would displace the last, and the reported offset would be built from two clocks that disagree.
+
+This is deliberately not an election. The module is a passive monitor and does not run the Best Master Clock Algorithm, so it reports which clock it is following rather than deciding which one ought to win. PTPv1 could not do so in any case — IEEE 1588-2002 has no Announce message, and so nothing to compare two clocks by.
+
+**Handover is by silence, not by preference.** Another clock takes over only once the one being followed has stopped transmitting for longer than its own sync receipt timeout. A grandmaster failover therefore proceeds normally, and is not reported as contention, because only one clock is transmitting at a time.
+
+**It reports the contention.** `$(ptp:masterContention)` is true while more than one clock is transmitting, `$(ptp:mastersLive)` lists them, and `$(ptp:mastersFound)` keeps every clock seen since the connection started. The _Multiple PTP Masters Detected_ feedback follows the same condition, and the split is logged as an error when it starts and cleared when it ends.
 
 ### Identifying a device beyond its clock identity
 
@@ -175,10 +222,11 @@ Not every device can be named, and on a Dante network many cannot. A large share
 | Steps Removed Above                | True when there are more boundary clocks between this host and the grandmaster than the threshold.                               |
 | Mean Path Delay Above              | True when the measured mean path delay exceeds the threshold, in nanoseconds. End to End only.                                   |
 | Path Trace Loop Detected           | True when a clock identity appears more than once in the PATH_TRACE of an Announce. Requires the grandmaster to emit path trace. |
+| Multiple PTP Masters Detected      | True while more than one clock is sending Sync on this domain. Available in both protocols.                                      |
 
 ## Variables
 
-**A PTPv1 connection publishes only the Time and Master variables, plus the two subdomain variables below.** Everything else on this page depends on data IEEE 1588-2002 does not carry, and is left out of the definitions. The same applies to feedbacks: PTPv1 offers only _PTP Synced_.
+**A PTPv1 connection publishes only the Time and Master variables, plus the two subdomain variables below.** Everything else on this page depends on data IEEE 1588-2002 does not carry, and is left out of the definitions. The same applies to feedbacks: PTPv1 offers _PTP Synced_ and _Multiple PTP Masters Detected_, both of which need only Sync messages.
 
 | Variable                 | Type       | Description                                                                                                    |
 | ------------------------ | ---------- | -------------------------------------------------------------------------------------------------------------- |
@@ -187,12 +235,15 @@ Not every device can be named, and on a Dante network many cannot. A large share
 
 ### Time
 
-| Variable           | Type     | Description                                            |
-| ------------------ | -------- | ------------------------------------------------------ |
-| `$(ptp:ptpTime)`   | `string` | PTP time in nanoseconds.                               |
-| `$(ptp:ptpTimeS)`  | `number` | PTP time, whole seconds.                               |
-| `$(ptp:ptpTimeNS)` | `number` | PTP time, nanoseconds within the current second.       |
-| `$(ptp:lastSync)`  | `string` | Timestamp of the last completed measurement, ISO 8601. |
+| Variable                 | Type     | Description                                                                                                        |
+| ------------------------ | -------- | ------------------------------------------------------------------------------------------------------------------ |
+| `$(ptp:ptpTime)`         | `string` | PTP time in nanoseconds.                                                                                           |
+| `$(ptp:ptpTimeS)`        | `number` | PTP time, whole seconds.                                                                                           |
+| `$(ptp:ptpTimeNS)`       | `number` | PTP time, nanoseconds within the current second.                                                                   |
+| `$(ptp:lastSync)`        | `string` | Timestamp of the last completed measurement, ISO 8601.                                                             |
+| `$(ptp:syncRate)`        | `number` | Sync messages arriving per second, averaged over the last 10 seconds. Compare with the rate the master advertises. |
+| `$(ptp:syncLossPercent)` | `number` | Percentage of the master's Sync messages missed, over the same window.                                             |
+| `$(ptp:syncLost)`        | `number` | Sync messages missed since the current master was adopted.                                                         |
 
 The PTP Time variables are a snapshot taken at each sync event, not a live clock.
 
@@ -205,41 +256,48 @@ The PTP Time variables are a snapshot taken at each sync event, not a live clock
 | `$(ptp:delayMechanism)`      | `string`  | The delay mechanism in use: `End to End`, `Peer to Peer`, `Passive`, or `Detecting` while Auto is still listening.                                                                                                                           |
 | `$(ptp:peerMeanPathDelay)`   | `number`  | Measured delay of the link to the directly attached neighbour, in nanoseconds. Peer to Peer only, and empty until the neighbour answers. This is one link, not the distance to the grandmaster.                                              |
 | `$(ptp:peerDelayResponding)` | `boolean` | Whether the attached neighbour is answering `Pdelay_Req`. False in a Peer to Peer network means the reported time excludes the local link delay.                                                                                             |
+| `$(ptp:delayResponding)`     | `boolean` | Whether the master is answering this module's `Delay_Req`. False after three go unanswered. Always true where none are sent.                                                                                                                 |
+| `$(ptp:delayReqDestination)` | `string`  | Where `Delay_Req` is being sent: the master's address when unicast is enabled, otherwise the multicast group.                                                                                                                                |
 
 ### Master
 
-| Variable                  | Type     | Description                                                                                                                                                                              |
-| ------------------------- | -------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `$(ptp:ptpMaster)`        | `string` | Clock identity and port number of the port sending Sync.                                                                                                                                 |
-| `$(ptp:ptpMasterAddress)` | `string` | Source IP address of that port.                                                                                                                                                          |
-| `$(ptp:ptpMasterMac)`     | `string` | MAC of that port. Recovered from the clock identity in PTPv2, and empty if that identity is not MAC-derived; read directly from the `sourceUuid` in PTPv1, where it is always available. |
-| `$(ptp:ptpMasterOui)`     | `string` | Manufacturer's IEEE-assigned block for that port, as hex.                                                                                                                                |
-| `$(ptp:ptpMasterVendor)`  | `string` | Manufacturer of that port, where its IEEE block is one the module carries.                                                                                                               |
-| `$(ptp:ptpVersion)`       | `string` | PTP version in use: `2.0` for IEEE 1588-2008, `2.1` for IEEE 1588-2019.                                                                                                                  |
+| Variable                  | Type       | Description                                                                                                                                                                              |
+| ------------------------- | ---------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `$(ptp:ptpMaster)`        | `string`   | Clock identity and port number of the port sending Sync.                                                                                                                                 |
+| `$(ptp:ptpMasterAddress)` | `string`   | Source IP address of that port.                                                                                                                                                          |
+| `$(ptp:ptpMasterMac)`     | `string`   | MAC of that port. Recovered from the clock identity in PTPv2, and empty if that identity is not MAC-derived; read directly from the `sourceUuid` in PTPv1, where it is always available. |
+| `$(ptp:ptpMasterOui)`     | `string`   | Manufacturer's IEEE-assigned block for that port, as hex.                                                                                                                                |
+| `$(ptp:ptpMasterVendor)`  | `string`   | Manufacturer of that port, where its IEEE block is one the module carries.                                                                                                               |
+| `$(ptp:mastersFound)`     | `string[]` | Every clock heard sending Sync on this domain since the connection started, in the order first seen.                                                                                     |
+| `$(ptp:mastersLive)`      | `string[]` | The clocks sending Sync now. More than one means the domain is split.                                                                                                                    |
+| `$(ptp:masterContention)` | `boolean`  | True while more than one clock is sending Sync. See above.                                                                                                                               |
+| `$(ptp:ptpVersion)`       | `string`   | PTP version in use: `2.0` for IEEE 1588-2008, `2.1` for IEEE 1588-2019.                                                                                                                  |
 
 ### Grandmaster
 
 Populated from Announce messages, and cleared if the Announce receipt timeout expires.
 
-| Variable                            | Type      | Description                                                                                                                                    |
-| ----------------------------------- | --------- | ---------------------------------------------------------------------------------------------------------------------------------------------- |
-| `$(ptp:grandmaster)`                | `string`  | Clock identity of the grandmaster.                                                                                                             |
-| `$(ptp:grandmasterMac)`             | `string`  | MAC of the grandmaster, recovered from its clock identity. Empty if the identity is not MAC-derived.                                           |
-| `$(ptp:grandmasterOui)`             | `string`  | Manufacturer's IEEE-assigned block for the grandmaster, as hex.                                                                                |
-| `$(ptp:grandmasterVendor)`          | `string`  | Manufacturer of the grandmaster, where its IEEE block is one the module carries.                                                               |
-| `$(ptp:grandmasterAddress)`         | `string`  | IP address of the grandmaster. Populated **only** when Steps Removed is 0; see above.                                                          |
-| `$(ptp:grandmasterClockClass)`      | `number`  | Clock class, numeric. Lower is better.                                                                                                         |
-| `$(ptp:grandmasterClockClassLabel)` | `string`  | Clock class as text, e.g. `Locked to primary reference`, `Holdover (was primary reference)`, `Default`.                                        |
-| `$(ptp:grandmasterAccuracy)`        | `string`  | Advertised accuracy, e.g. `100ns`, `1us`, `Unknown`.                                                                                           |
-| `$(ptp:grandmasterTimeSource)`      | `string`  | Time source, e.g. `GNSS`, `Atomic Clock`, `Internal Oscillator`, `NTP`.                                                                        |
-| `$(ptp:grandmasterPriority1)`       | `number`  | Priority 1, as used by the Best Master Clock Algorithm.                                                                                        |
-| `$(ptp:grandmasterPriority2)`       | `number`  | Priority 2.                                                                                                                                    |
-| `$(ptp:stepsRemoved)`               | `number`  | Number of boundary clocks between this host and the grandmaster.                                                                               |
-| `$(ptp:announceInterval)`           | `number`  | The Announce interval the grandmaster advertises, in seconds.                                                                                  |
-| `$(ptp:lastAnnounce)`               | `string`  | Timestamp of the last Announce received, ISO 8601.                                                                                             |
-| `$(ptp:pathTrace)`                  | `string`  | The clock identity chain from the grandmaster to the transmitting clock, joined with `>`. Empty unless the grandmaster emits a PATH_TRACE TLV. |
-| `$(ptp:pathTraceHops)`              | `number`  | Number of clocks in that chain.                                                                                                                |
-| `$(ptp:pathTraceLoop)`              | `boolean` | True when an identity repeats in the chain, meaning the Announce went round a loop.                                                            |
+| Variable                            | Type       | Description                                                                                                                                                       |
+| ----------------------------------- | ---------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `$(ptp:grandmaster)`                | `string`   | Clock identity of the grandmaster.                                                                                                                                |
+| `$(ptp:grandmasterMac)`             | `string`   | MAC of the grandmaster, recovered from its clock identity. Empty if the identity is not MAC-derived.                                                              |
+| `$(ptp:grandmasterOui)`             | `string`   | Manufacturer's IEEE-assigned block for the grandmaster, as hex.                                                                                                   |
+| `$(ptp:grandmasterVendor)`          | `string`   | Manufacturer of the grandmaster, where its IEEE block is one the module carries.                                                                                  |
+| `$(ptp:grandmasterAddress)`         | `string`   | IP address of the grandmaster. Populated **only** when Steps Removed is 0; see above.                                                                             |
+| `$(ptp:grandmasterClockClass)`      | `number`   | Clock class, numeric. Lower is better.                                                                                                                            |
+| `$(ptp:grandmasterClockClassLabel)` | `string`   | Clock class as text, e.g. `Locked to primary reference`, `Holdover (was primary reference)`, `Default`.                                                           |
+| `$(ptp:grandmasterAccuracy)`        | `string`   | Advertised accuracy, e.g. `100ns`, `1us`, `Unknown`.                                                                                                              |
+| `$(ptp:grandmasterTimeSource)`      | `string`   | Time source, e.g. `GNSS`, `Atomic Clock`, `Internal Oscillator`, `NTP`.                                                                                           |
+| `$(ptp:grandmasterPriority1)`       | `number`   | Priority 1, as used by the Best Master Clock Algorithm.                                                                                                           |
+| `$(ptp:grandmasterPriority2)`       | `number`   | Priority 2.                                                                                                                                                       |
+| `$(ptp:stepsRemoved)`               | `number`   | Number of boundary clocks between this host and the grandmaster.                                                                                                  |
+| `$(ptp:announceInterval)`           | `number`   | The Announce interval the grandmaster advertises, in seconds.                                                                                                     |
+| `$(ptp:announceRate)`               | `number`   | Announce messages arriving per second, averaged over the last 10 seconds. Compare with the interval above.                                                        |
+| `$(ptp:domainsFound)`               | `number[]` | Every PTP domain heard on the wire, including ones this connection is not listening to. Traffic on another domain is the usual reason for hearing nothing at all. |
+| `$(ptp:lastAnnounce)`               | `string`   | Timestamp of the last Announce received, ISO 8601.                                                                                                                |
+| `$(ptp:pathTrace)`                  | `string`   | The clock identity chain from the grandmaster to the transmitting clock, joined with `>`. Empty unless the grandmaster emits a PATH_TRACE TLV.                    |
+| `$(ptp:pathTraceHops)`              | `number`   | Number of clocks in that chain.                                                                                                                                   |
+| `$(ptp:pathTraceLoop)`              | `boolean`  | True when an identity repeats in the chain, meaning the Announce went round a loop.                                                                               |
 
 ### Time properties
 

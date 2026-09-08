@@ -9,6 +9,7 @@ export enum FeedbackIDs {
 	StepsRemoved = 'stepsRemoved',
 	PathDelay = 'pathDelay',
 	PathTraceLoop = 'pathTraceLoop',
+	MasterContention = 'masterContention',
 }
 
 export type FeedbacksSchema = {
@@ -19,6 +20,7 @@ export type FeedbacksSchema = {
 	[FeedbackIDs.StepsRemoved]: { type: 'boolean'; options: { maxSteps: number } }
 	[FeedbackIDs.PathDelay]: { type: 'boolean'; options: { maxDelay: number } }
 	[FeedbackIDs.PathTraceLoop]: { type: 'boolean'; options: Record<string, never> }
+	[FeedbackIDs.MasterContention]: { type: 'boolean'; options: Record<string, never> }
 }
 
 const alarmStyle = {
@@ -44,6 +46,17 @@ export function UpdateFeedbacks(self: ModuleInstance): void {
 			options: [],
 			callback: () => {
 				return self.client?.is_synced ?? false
+			},
+		},
+		[FeedbackIDs.MasterContention]: {
+			type: 'boolean',
+			name: 'Multiple PTP Masters Detected',
+			description:
+				'True while more than one clock is sending Sync on this domain. Usually a split domain — two grandmasters that cannot see each other, most often because multicast is being dropped between sites.',
+			defaultStyle: alarmStyle,
+			options: [],
+			callback: () => {
+				return self.client?.master_contention ?? false
 			},
 		},
 		[FeedbackIDs.TimeTraceable]: isV1

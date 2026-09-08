@@ -4,6 +4,7 @@ import { isIPv4 } from 'net'
 import { networkInterfaces } from 'os'
 import { randomBytes } from 'crypto'
 import { lookupOui } from './oui.js'
+import { SlidingWindow, StepDetector, missedBetween, round } from './metrics.js'
 
 export type PtpTime = [number, number]
 
@@ -365,6 +366,20 @@ const clockClassLabels: Record<number, string> = {
 	255: 'Slave only',
 }
 
+/**
+ * How many Delay_Req may go unanswered before the master is called unresponsive. Requests are
+ * already paced by the configured interval, so this is a count rather than a timer — three of
+ * them is long enough that a single dropped packet does not raise it.
+ */
+const UNANSWERED_DELAY_REQS = 3
+
+/** Shortest gap between two path delay step reports, so an unstable path cannot flood the log */
+const PATH_STEP_QUIET_MS = 30_000
+
+/** flagField sits at bytes 6-7; unicastFlag is bit 2 of the first, so 0x0400 read big-endian */
+const FLAG_FIELD_OFFSET = 6
+const FLAG_UNICAST = 0x0400
+
 const decodeFlags = (flags: number): PtpFlags => ({
 	alternateMaster: (flags & 0x0100) !== 0,
 	twoStep: (flags & 0x0200) !== 0,
@@ -435,6 +450,16 @@ export interface PTPv2ClientEvents {
 	flags_changed: [flags: PtpFlags]
 	domains: [domains: SetIterator<number>]
 	ptp_master_changed: [ptp_master: string, address: string, sync: boolean]
+	/** Every distinct clock seen sending Sync on the joined domain, in the order first seen */
+	masters: [masters: string[]]
+	/** More than one clock is sending Sync on this domain right now, or has stopped being */
+	master_contention_changed: [contending: boolean, masters: string[]]
+	/** Observed Sync/Announce rate or loss has been recalculated; at most once a second */
+	metrics_changed: []
+	/** The master has stopped answering our Delay_Req, or has started again */
+	delay_response_changed: [responding: boolean, consecutiveUnanswered: number]
+	/** The measured path delay has moved to a different plateau, in nanoseconds */
+	path_delay_step: [from: bigint, to: bigint]
 	ptp_time_synced: [time: PtpTime, lastSync: number]
 	sync_changed: [sync: boolean]
 	master_lost: [reason: string]
@@ -491,6 +516,31 @@ export class PTPv2Client extends EventEmitter<PTPv2ClientEvents> {
 	private announce: PtpAnnounce | undefined
 	private announceAddress: string = ''
 	private ptpMasterIdentity: Buffer | undefined
+	// Every clock heard sending Sync on this domain, and when it was last heard. Two live
+	// entries means the domain is split — commonly two grandmasters that cannot see each
+	// other because multicast is being dropped between sites.
+	private mastersSeen: Map<string, number> = new Map<string, number>()
+	private contending: boolean = false
+	// Observed message rates and loss, measured from what arrives rather than from what the
+	// master advertises. A master claiming 8 Sync per second while 6 arrive is multicast
+	// being dropped somewhere in between, which nothing else the client reports would show.
+	private syncWindow = new SlidingWindow()
+	private syncLostWindow = new SlidingWindow()
+	private announceWindow = new SlidingWindow()
+	private lastSyncSeq: number | undefined = undefined
+	private syncLostTotal: number = 0
+	private lastMetricsEmit: number = 0
+	// A Delay_Req that is never answered is the one hard failure that otherwise says nothing
+	// at all: the clock simply never locks. Counted rather than timed, because the request
+	// rate is the configured interval and so already paced.
+	private unansweredDelayReqs: number = 0
+	private delayResponding: boolean = true
+	private unicastDelayReq: boolean = false
+	// A route change or a newly asymmetric path shows up as the path delay settling at a
+	// different value. That is an event rather than a state, so it is reported once when it
+	// happens rather than exposed as something to be above or below.
+	private pathDelayStep = new StepDetector()
+	private lastPathStepAt: number = 0
 	private lastAnnounce: number = 0
 	private flags: PtpFlags = decodeFlags(0)
 	private lastCorrection: bigint = 0n
@@ -522,6 +572,8 @@ export class PTPv2Client extends EventEmitter<PTPv2ClientEvents> {
 	 * @param interval Minimum PTP sync interval (125ms)
 	 * @param delayMechanism How to establish path delay: 'e2e', 'p2p', 'passive', or 'auto'
 	 *                       to detect between P2P and E2E by listening first (default)
+	 * @param unicast Send Delay_Req straight to the master rather than to the group. Falls
+	 *                back to multicast until a master has been heard from.
 	 */
 
 	constructor(
@@ -529,6 +581,7 @@ export class PTPv2Client extends EventEmitter<PTPv2ClientEvents> {
 		domain: number = 0,
 		interval: number = 10000,
 		delayMechanism: DelayMechanism = 'auto',
+		unicast: boolean = false,
 	) {
 		super()
 		if (!isIPv4(iface)) {
@@ -539,6 +592,7 @@ export class PTPv2Client extends EventEmitter<PTPv2ClientEvents> {
 		this.addr = iface
 		if (domain >= 0 && domain <= 255) this.ptp_domain = Math.round(domain)
 		if (interval >= 125) this.minSyncInterval = Math.round(interval)
+		this.unicastDelayReq = unicast
 		this.delayMechanism = delayMechanism
 
 		if (delayMechanism === 'auto') {
@@ -618,17 +672,21 @@ export class PTPv2Client extends EventEmitter<PTPv2ClientEvents> {
 				//only process sync messages
 				return
 
-			//do we have a new ptp master?
-			if (source != this.ptpMaster) {
-				this.ptpMaster = source
-				this.ptpMasterAddress = rinfo.address
-				// copied, not a subarray: the socket's buffer is not ours to hold on to
-				this.ptpMasterIdentity = Buffer.from(
-					buffer.subarray(SOURCE_PORT_IDENTITY_OFFSET, SOURCE_PORT_IDENTITY_OFFSET + 8),
-				)
-				// Route through sync_change so listeners see the transition
-				this.sync_change(false)
-				this.emit('ptp_master_changed', this.ptpMaster, rinfo.address, this.sync)
+			this.noteMaster(source)
+
+			// Follow exactly one master. A slave synchronises to one clock, and taking
+			// whichever spoke last would mix two grandmasters' timestamps on every packet and
+			// never lock. Selection is first heard wins, handing over once the incumbent has
+			// gone quiet — this module is a passive monitor and does not run the BMCA, so it
+			// reports what it is following rather than deciding what ought to win.
+			if (this.ptpMaster === '') {
+				this.adoptMaster(source, rinfo.address, buffer)
+			} else if (source != this.ptpMaster) {
+				// A rival. Recorded by noteMaster and reported as contention, but nothing it
+				// carries may touch the measurement: not the sequence a Follow_Up is matched
+				// on, not the flags, not the advertised interval, not the receipt timeout.
+				if (!this.incumbentIsStale()) return
+				this.adoptMaster(source, rinfo.address, buffer)
 			}
 
 			this.updateFlags(flags, false)
@@ -636,6 +694,8 @@ export class PTPv2Client extends EventEmitter<PTPv2ClientEvents> {
 			// The master advertises its own Sync rate; the receipt timeout follows it
 			this.logSyncInterval = buffer.readInt8(LOG_MSG_INTERVAL_OFFSET)
 			this.startSyncTimeout()
+
+			this.noteSync(sequence)
 
 			//save sequence number
 			this.sync_seq = sequence
@@ -683,12 +743,25 @@ export class PTPv2Client extends EventEmitter<PTPv2ClientEvents> {
 
 			if (type == MSG_ANNOUNCE) {
 				if (buffer.length < ANNOUNCE_LENGTH) return
+				// Announce and Sync come from the same port, so once a master is chosen the
+				// grandmaster data follows it. Unfiltered, a split domain would flip every
+				// grandmaster variable between two sites on every Announce. Before the first
+				// Sync there is nothing to compare against, so the first Announce is taken.
+				if (this.ptpMaster !== '' && formatPortIdentity(buffer) !== this.ptpMaster) return
 				this.updateFlags(buffer.readUInt16BE(6), true)
+				this.announceWindow.add()
 				this.updateAnnounce(readAnnounce(buffer), rinfo.address)
+				this.emitMetrics()
 				return
 			}
 
 			if (buffer.length < TIMESTAMP_OFFSET + TIMESTAMP_LENGTH) return
+
+			// Both of these are matched by sequence number, which is only unique per port, so
+			// the sender has to be checked too: a rival grandmaster's Follow_Up would
+			// otherwise hand us its t1, and a rival's Delay_Resp its t4. Delay_Req is
+			// multicast, so every master on the domain may answer ours.
+			if (formatPortIdentity(buffer) !== this.ptpMaster) return
 
 			if (type == MSG_FOLLOW_UP && this.sync_seq == sequence && this.dueForExchange()) {
 				//follow up msg with current seq
@@ -713,7 +786,9 @@ export class PTPv2Client extends EventEmitter<PTPv2ClientEvents> {
 				// The other half of the same measurement: ((t2 − t1) + (t4 − t3)) / 2.
 				// Rising path delay is how a congested or asymmetric link shows up.
 				this.meanPathDelay = (this.ts1 - this.t1 + (this.ts2 - this.t2)) / 2n
+				this.notePathDelay(this.meanPathDelay)
 
+				this.noteDelayRespReceived()
 				this.lastSync = Date.now()
 				this.emit('ptp_time_synced', this.ptp_time, this.lastSync)
 				//check if the clock was synced before
@@ -935,9 +1010,14 @@ export class PTPv2Client extends EventEmitter<PTPv2ClientEvents> {
 
 	private sendDelayReq(): void {
 		this.lastRequest = Date.now()
+		this.noteDelayReqSent()
+		// Unicast keeps this module's Delay_Req off every other device on the domain. It needs
+		// an address, so the group is still used until a master has been heard from.
+		const unicast = this.unicastDelayReq && this.ptpMasterAddress !== ''
+		const destination = unicast ? this.ptpMasterAddress : PTP_PRIMARY_MULTICAST
 		setImmediate(() => {
 			if (this.destroyed) return
-			this.ptpClientEvent.send(this.ptp_delay_req(), PTP_EVENT_PORT, PTP_PRIMARY_MULTICAST, (err, _bytes) => {
+			this.ptpClientEvent.send(this.ptp_delay_req(unicast), PTP_EVENT_PORT, destination, (err, _bytes) => {
 				if (err) {
 					this.emit('error', err)
 				} else {
@@ -974,7 +1054,7 @@ export class PTPv2Client extends EventEmitter<PTPv2ClientEvents> {
 	 *
 	 */
 
-	private ptp_delay_req(): Buffer<ArrayBuffer> {
+	private ptp_delay_req(unicast: boolean = false): Buffer<ArrayBuffer> {
 		const buffer = Buffer.alloc(DELAY_REQ_LENGTH)
 		this.req_seq = (this.req_seq + 1) % 0x10000
 
@@ -986,6 +1066,9 @@ export class PTPv2Client extends EventEmitter<PTPv2ClientEvents> {
 		// Without a sourcePortIdentity the master echoes back all zeroes, leaving every client
 		// on the network indistinguishable in the Delay_Resp
 		this.portIdentity.copy(buffer, SOURCE_PORT_IDENTITY_OFFSET)
+		// IEEE 1588-2008 §13.3.2.6: a message sent to a unicast address sets unicastFlag, so
+		// the master knows to answer the same way rather than to the group
+		if (unicast) buffer.writeUInt16BE(FLAG_UNICAST, FLAG_FIELD_OFFSET)
 		buffer.writeUInt16BE(this.req_seq, SEQUENCE_OFFSET)
 		buffer.writeUInt8(0x01, CONTROL_FIELD_OFFSET) // controlField: Delay_Req
 		buffer.writeUInt8(0x7f, LOG_MSG_INTERVAL_OFFSET) // logMessageInterval: not periodic
@@ -1054,6 +1137,151 @@ export class PTPv2Client extends EventEmitter<PTPv2ClientEvents> {
 	 * Check if we have seen this domain before and if not emit event with set of found domains
 	 *
 	 */
+
+	/**
+	 * Take this clock as the one to follow, abandoning any exchange in flight with the last.
+	 * The offset is kept: it remains this host's best estimate of PTP time while the new
+	 * master's first exchange completes.
+	 */
+	private adoptMaster(source: string, address: string, buffer: Buffer): void {
+		this.ptpMaster = source
+		this.ptpMasterAddress = address
+		// copied, not a subarray: the socket's buffer is not ours to hold on to
+		this.ptpMasterIdentity = Buffer.from(buffer.subarray(SOURCE_PORT_IDENTITY_OFFSET, SOURCE_PORT_IDENTITY_OFFSET + 8))
+		// Half-finished timestamps belong to the clock that has just been dropped, and its
+		// sequence numbers mean nothing against the new one's
+		this.t1 = 0n
+		this.ts1 = 0n
+		this.syncCorrection = 0n
+		this.resetMetrics()
+		this.pathDelayStep.reset()
+		this.unansweredDelayReqs = 0
+		// Route through sync_change so listeners see the transition
+		this.sync_change(false)
+		this.emit('ptp_master_changed', this.ptpMaster, address, this.sync)
+	}
+
+	/**
+	 * Has the master we are following stopped transmitting for long enough to hand over?
+	 * Measured against the same receipt timeout that drops sync, so a handover cannot happen
+	 * while the incumbent still counts as present.
+	 */
+	private incumbentIsStale(): boolean {
+		const lastHeard = this.mastersSeen.get(this.ptpMaster)
+		if (lastHeard === undefined) return true
+		return Date.now() - lastHeard > this.sync_receipt_timeout
+	}
+
+	/**
+	 * Record a clock as sending Sync here, and re-evaluate whether the domain is contended.
+	 *
+	 * Contention is judged on what is transmitting *now*: a clean failover leaves two entries
+	 * in the list but only one of them live, and calling that contention would cry wolf on
+	 * every handover.
+	 */
+	private noteMaster(source: string): void {
+		const known = this.mastersSeen.has(source)
+		this.mastersSeen.set(source, Date.now())
+		if (!known) this.emit('masters', [...this.mastersSeen.keys()])
+
+		const live = this.liveMasters()
+		const contending = live.length > 1
+		if (contending === this.contending) return
+		this.contending = contending
+		this.emit('master_contention_changed', contending, live)
+	}
+
+	/** The clocks that have sent Sync recently enough to still count as present */
+	private liveMasters(): string[] {
+		const cutoff = Date.now() - this.sync_receipt_timeout
+		return [...this.mastersSeen].filter(([, seen]) => seen > cutoff).map(([source]) => source)
+	}
+
+	/**
+	 * Record a Sync from the master and account for any that went missing before it.
+	 *
+	 * Loss is counted from gaps in the sequence number, the only evidence a passive observer
+	 * has that a message was sent at all. Resets on a master change: sequence numbers are per
+	 * port and mean nothing across two clocks.
+	 */
+	private noteSync(sequence: number): void {
+		this.syncWindow.add()
+		if (this.lastSyncSeq !== undefined) {
+			const missed = missedBetween(this.lastSyncSeq, sequence)
+			if (missed === undefined) {
+				// A repeat, a reordering, or a restart — re-base rather than count it
+				this.lastSyncSeq = sequence
+				this.emitMetrics()
+				return
+			}
+			if (missed > 0) {
+				this.syncLostTotal += missed
+				this.syncLostWindow.add(missed)
+			}
+		}
+		this.lastSyncSeq = sequence
+		this.emitMetrics()
+	}
+
+	/** Reset every measurement that belongs to the clock being left behind */
+	private resetMetrics(): void {
+		this.syncWindow.reset()
+		this.syncLostWindow.reset()
+		this.announceWindow.reset()
+		this.lastSyncSeq = undefined
+		this.syncLostTotal = 0
+	}
+
+	/**
+	 * Rates move on every Sync, which is up to 128 a second. Publishing that often would be
+	 * pointless churn, so it is throttled to once a second — still far faster than the
+	 * measurement window, and it keeps updating when nothing else is, which is exactly when
+	 * the loss figure matters.
+	 */
+	private emitMetrics(): void {
+		const now = Date.now()
+		if (now - this.lastMetricsEmit < 1000) return
+		this.lastMetricsEmit = now
+		this.emit('metrics_changed')
+	}
+
+	/**
+	 * Count a Delay_Req as outstanding, and say so once enough have gone unanswered.
+	 *
+	 * A master that never answers leaves the client permanently unsynced with nothing else to
+	 * show for it. Peer to peer already reports its equivalent through peer_responding; this
+	 * is the end to end counterpart.
+	 */
+	private noteDelayReqSent(): void {
+		this.unansweredDelayReqs++
+		if (this.delayResponding && this.unansweredDelayReqs >= UNANSWERED_DELAY_REQS) {
+			this.delayResponding = false
+			this.emit('delay_response_changed', false, this.unansweredDelayReqs)
+		}
+	}
+
+	/**
+	 * Feed a path delay measurement to the step detector and report a plateau change.
+	 *
+	 * Rate limited because a delay that oscillates between two plateaus would otherwise
+	 * report on every crossing. The detector already refuses to move for anything smaller
+	 * than a real step, so this only guards against a genuinely unstable path.
+	 */
+	private notePathDelay(delay: bigint): void {
+		const step = this.pathDelayStep.push(delay)
+		if (step === undefined) return
+		const now = Date.now()
+		if (now - this.lastPathStepAt < PATH_STEP_QUIET_MS) return
+		this.lastPathStepAt = now
+		this.emit('path_delay_step', step[0], step[1])
+	}
+
+	private noteDelayRespReceived(): void {
+		this.unansweredDelayReqs = 0
+		if (this.delayResponding) return
+		this.delayResponding = true
+		this.emit('delay_response_changed', true, 0)
+	}
 
 	private addDomain(domain: number): void {
 		// No upper filter: the byte cannot exceed 255, and 128–255 are a legitimate IEEE
@@ -1255,6 +1483,65 @@ export class PTPv2Client extends EventEmitter<PTPv2ClientEvents> {
 	 * MAC of the port sending Sync, recovered from its clockIdentity where possible
 	 *
 	 */
+
+	/**
+	 * Every clock heard sending Sync on this domain, in the order first seen. More than one
+	 * means the domain is or has been split.
+	 */
+	public get masters_found(): string[] {
+		return [...this.mastersSeen.keys()]
+	}
+
+	/** The clocks currently sending Sync — one on a healthy domain, more than one if split */
+	public get masters_live(): string[] {
+		return this.liveMasters()
+	}
+
+	/** Whether more than one clock is sending Sync on this domain right now */
+	public get master_contention(): boolean {
+		return this.contending
+	}
+
+	/** Sync messages per second actually arriving from the master */
+	public get sync_rate(): number {
+		return round(this.syncWindow.perSecond())
+	}
+
+	/** Announce messages per second actually arriving from the master */
+	public get announce_rate(): number {
+		return round(this.announceWindow.perSecond())
+	}
+
+	/**
+	 * Percentage of the master's Sync messages that went missing, over the averaging window
+	 * defined in metrics.ts. Derived from gaps in the sequence numbers, so it counts what the
+	 * master sent and this host never saw.
+	 */
+	public get sync_loss_percent(): number {
+		const lost = this.syncLostWindow.count()
+		const received = this.syncWindow.count()
+		if (lost + received === 0) return 0
+		return round((lost * 100) / (lost + received))
+	}
+
+	/** Sync messages missed since the current master was adopted */
+	public get sync_lost_total(): number {
+		return this.syncLostTotal
+	}
+
+	/**
+	 * Whether the master is answering this client's Delay_Req. Always true where none are
+	 * sent — peer to peer reports its neighbour through peer_responding instead, and passive
+	 * transmits nothing at all.
+	 */
+	public get delay_responding(): boolean {
+		return this.delayResponding
+	}
+
+	/** Where Delay_Req is being sent: the master directly, or the multicast group */
+	public get delay_req_destination(): string {
+		return this.unicastDelayReq && this.ptpMasterAddress !== '' ? this.ptpMasterAddress : PTP_PRIMARY_MULTICAST
+	}
 
 	public get ptp_master_mac(): string | undefined {
 		return this.ptpMasterIdentity ? macFromClockIdentity(this.ptpMasterIdentity) : undefined

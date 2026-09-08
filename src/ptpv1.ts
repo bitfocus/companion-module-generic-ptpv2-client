@@ -4,6 +4,7 @@ import { isIPv4 } from 'net'
 import { networkInterfaces } from 'os'
 import { randomBytes } from 'crypto'
 import { lookupOui } from './oui.js'
+import { SlidingWindow, missedBetween, round } from './metrics.js'
 
 export type PtpTime = [number, number]
 
@@ -169,6 +170,13 @@ const NS_PER_S = 1_000_000_000n
 // timeout is a multiple of what the master actually advertises, not of our own poll rate.
 const DEFAULT_LOG_SYNC_INTERVAL = 1
 const SYNC_RECEIPT_TIMEOUT = 3
+
+/**
+ * How many Delay_Req may go unanswered before the master is called unresponsive. Requests are
+ * already paced by the configured interval, so this is a count rather than a timer — three of
+ * them is long enough that a single dropped packet does not raise it.
+ */
+const UNANSWERED_DELAY_REQS = 3
 const MIN_SYNC_INTERVAL_MS = 1000 / 128
 const MAX_SYNC_INTERVAL_MS = 16_000
 
@@ -296,6 +304,14 @@ export interface PTPv1ClientEvents {
 	error: [err: Error]
 	listening: [msg: string]
 	ptp_master_changed: [ptp_master: string, address: string, sync: boolean]
+	/** Every distinct clock seen sending Sync on the joined subdomain, in the order first seen */
+	masters: [masters: string[]]
+	/** More than one clock is sending Sync on this subdomain right now, or has stopped being */
+	master_contention_changed: [contending: boolean, masters: string[]]
+	/** Observed Sync rate or loss has been recalculated; throttled to at most once a second */
+	metrics_changed: []
+	/** The master has stopped answering our Delay_Req, or has started again */
+	delay_response_changed: [responding: boolean, consecutiveUnanswered: number]
 	ptp_time_synced: [time: PtpTime, lastSync: number]
 	sync_changed: [sync: boolean]
 	domains: [domains: SetIterator<string>]
@@ -334,6 +350,26 @@ export class PTPv1Client extends EventEmitter<PTPv1ClientEvents> {
 	// The master's raw sourceUuid. Kept alongside the formatted identity because it is an
 	// EUI-48, and so answers for the MAC, OUI and manufacturer without further work.
 	private ptpMasterUuid: Buffer | undefined = undefined
+	// Every clock heard sending Sync on this subdomain, and when it was last heard. A split
+	// PTP domain — two grandmasters that cannot see each other, usually because multicast is
+	// being dropped between sites — shows up here as two live entries and nowhere else.
+	private mastersSeen: Map<string, number> = new Map<string, number>()
+	private contending: boolean = false
+	// Observed message rates and loss, measured from what arrives rather than from what the
+	// master advertises. A master claiming 8 Sync per second while 6 arrive is multicast
+	// being dropped somewhere in between, which nothing else the client reports would show.
+	private syncWindow = new SlidingWindow()
+	private syncLostWindow = new SlidingWindow()
+	private lastSyncSeq: number | undefined = undefined
+	private syncLostTotal: number = 0
+	private lastMetricsEmit: number = 0
+	// A Delay_Req that is never answered is the one hard failure that otherwise says nothing
+	// at all: the clock simply never locks. Counted rather than timed, because the request
+	// rate is the configured interval and so already paced.
+	private unansweredDelayReqs: number = 0
+	private delayResponding: boolean = true
+	private unicastDelayReq: boolean = false
+
 	private minSyncInterval: number = 10000
 	private subdomainsFound: Set<string> = new Set<string>()
 	private destroyed: boolean = false
@@ -371,6 +407,9 @@ export class PTPv1Client extends EventEmitter<PTPv1ClientEvents> {
 	 *                   ASCII name of up to 15 characters is accepted, since a Dante Domain
 	 *                   Manager network may use one outside the well-known set.
 	 * @param interval   Minimum sync interval in ms (minimum 125ms, default 10000ms)
+	 * @param unicast    Send Delay_Req straight to the master rather than to the group. Falls
+	 *                   back to multicast until a master has been heard from, since until then
+	 *                   there is no address to send to.
 	 * @param multicast  The group to join. Required for a subdomain outside the well-known
 	 *                   set, whose address cannot be derived from its name; ignored otherwise.
 	 */
@@ -379,6 +418,7 @@ export class PTPv1Client extends EventEmitter<PTPv1ClientEvents> {
 		subdomain: string = PTP_SUBDOMAIN_DEFAULT,
 		interval: number = 10000,
 		multicast?: string,
+		unicast: boolean = false,
 	) {
 		super()
 
@@ -423,6 +463,7 @@ export class PTPv1Client extends EventEmitter<PTPv1ClientEvents> {
 		this.subdomainBuf = encodeSubdomain(subdomain)
 		this.multicast = group
 		if (interval >= 125) this.minSyncInterval = Math.round(interval)
+		this.unicastDelayReq = unicast
 		this.sourceUuid = uuidForAddress(this.addr)
 
 		this.ptpClientEvent.on('listening', () => {
@@ -462,17 +503,24 @@ export class PTPv1Client extends EventEmitter<PTPv1ClientEvents> {
 			if (!buffer.subarray(SUBDOMAIN_OFFSET, SUBDOMAIN_END).equals(this.subdomainBuf)) return
 
 			const source = formatSourceId(buffer)
+			this.noteMaster(source)
 
-			// Detect master change
-			if (source !== this.ptpMaster) {
-				this.ptpMaster = source
-				this.ptpMasterAddress = rinfo.address
-				// Copied, not referenced: dgram reuses its receive buffer for the next datagram
-				this.ptpMasterUuid = Buffer.from(buffer.subarray(SOURCE_UUID_OFFSET, SOURCE_UUID_OFFSET + SOURCE_UUID_LENGTH))
-				this.sync_change(false)
-				this.emit('ptp_master_changed', this.ptpMaster, rinfo.address, this.sync)
+			// Follow exactly one master. IEEE 1588-2002 has no field saying which clock is the
+			// better one — that is what the BMCA decides from Announce, which PTPv1 does not
+			// have — so the only defensible policy is first heard wins, handing over when the
+			// incumbent goes quiet. Taking whichever clock spoke last instead would mix one
+			// grandmaster's timestamps with another's and never lock at all.
+			if (this.ptpMaster === '') {
+				this.adoptMaster(source, rinfo.address, buffer)
+			} else if (source !== this.ptpMaster) {
+				// A rival. It is recorded by noteMaster and surfaces as contention, but nothing
+				// it carries may touch the measurement: not the sequence a Follow_Up is matched
+				// on, not the advertised interval, and not the receipt timeout.
+				if (!this.incumbentIsStale()) return
+				this.adoptMaster(source, rinfo.address, buffer)
 			}
 
+			this.noteSync(sequence)
 			this.sync_seq = sequence
 
 			// The master advertises its own Sync rate; the receipt timeout follows it. A short
@@ -511,6 +559,11 @@ export class PTPv1Client extends EventEmitter<PTPv1ClientEvents> {
 
 			if (control === CTRL_FOLLOW_UP) {
 				if (buffer.length < FU_LENGTH) return
+				// A Follow_Up is matched to its Sync by sequence, and a sequenceId is only
+				// unique per port — so without this a rival grandmaster's Follow_Up whose
+				// number happened to collide would hand us its t1 to pair with our master's
+				// receive timestamp
+				if (formatSourceId(buffer) !== this.ptpMaster) return
 				// A Follow_Up carries its own sequenceId in the header and the sequenceId of
 				// the Sync it belongs to in associatedSequenceId. Only the latter identifies
 				// the exchange; a master that numbers its Follow_Ups separately would never
@@ -525,6 +578,10 @@ export class PTPv1Client extends EventEmitter<PTPv1ClientEvents> {
 
 			if (control === CTRL_DELAY_RSP) {
 				if (buffer.length < DR_LENGTH) return
+				// Delay_Req goes to the multicast group, so every master on the subdomain can
+				// answer it and every answer carries our requester fields. isOurDelayResp only
+				// proves the response is addressed to us, not that it came from our master.
+				if (formatSourceId(buffer) !== this.ptpMaster) return
 				if (!this.isOurDelayResp(buffer)) return
 
 				// The master's receive timestamp for our Delay_Req
@@ -536,6 +593,7 @@ export class PTPv1Client extends EventEmitter<PTPv1ClientEvents> {
 				const correction = (this.ts1 - this.t1 - (this.ts2 - this.t2)) / 2n
 				this.offset += correction
 
+				this.noteDelayRespReceived()
 				this.lastSync = Date.now()
 				this.emit('ptp_time_synced', this.ptp_time, this.lastSync)
 				this.startSyncTimeout()
@@ -601,6 +659,56 @@ export class PTPv1Client extends EventEmitter<PTPv1ClientEvents> {
 	/** Manufacturer of the port sending Sync, where its block is one we carry */
 	public get ptp_master_vendor(): string | undefined {
 		return this.ptpMasterUuid ? vendorFromUuid(this.ptpMasterUuid) : undefined
+	}
+
+	/**
+	 * Every clock heard sending Sync on this subdomain, in the order first seen. More than
+	 * one means the domain is or has been split.
+	 */
+	public get masters_found(): string[] {
+		return [...this.mastersSeen.keys()]
+	}
+
+	/** The clocks currently sending Sync — one on a healthy domain, more than one if split */
+	public get masters_live(): string[] {
+		return this.liveMasters()
+	}
+
+	/** Whether more than one clock is sending Sync on this subdomain right now */
+	public get master_contention(): boolean {
+		return this.contending
+	}
+
+	/** Whether the master is answering this client's Delay_Req */
+	public get delay_responding(): boolean {
+		return this.delayResponding
+	}
+
+	/** Where Delay_Req is being sent: the master directly, or the multicast group */
+	public get delay_req_destination(): string {
+		return this.unicastDelayReq && this.ptpMasterAddress !== '' ? this.ptpMasterAddress : this.multicast
+	}
+
+	/** Sync messages per second actually arriving from the master */
+	public get sync_rate(): number {
+		return round(this.syncWindow.perSecond())
+	}
+
+	/**
+	 * Percentage of the master's Sync messages that went missing, over the averaging window
+	 * defined in metrics.ts. Derived from gaps in the sequence numbers, so it counts what the
+	 * master sent and this host never saw.
+	 */
+	public get sync_loss_percent(): number {
+		const lost = this.syncLostWindow.count()
+		const received = this.syncWindow.count()
+		if (lost + received === 0) return 0
+		return round((lost * 100) / (lost + received))
+	}
+
+	/** Sync messages missed since the current master was adopted */
+	public get sync_lost_total(): number {
+		return this.syncLostTotal
 	}
 
 	/** Timestamp (Date.now()) of the most recent completed sync exchange. */
@@ -744,9 +852,14 @@ export class PTPv1Client extends EventEmitter<PTPv1ClientEvents> {
 
 	private sendDelayReq(): void {
 		this.lastRequest = Date.now()
+		this.noteDelayReqSent()
+		// Unicast keeps this module's Delay_Req off every other device on the network, which
+		// is why Dante offers the same option. It needs an address, so the multicast group is
+		// still used until a master has been heard from.
+		const destination = this.unicastDelayReq && this.ptpMasterAddress !== '' ? this.ptpMasterAddress : this.multicast
 		setImmediate(() => {
 			if (this.destroyed) return
-			this.ptpClientEvent.send(this.ptp_delay_req(), PTP_EVENT_PORT, this.multicast, (err) => {
+			this.ptpClientEvent.send(this.ptp_delay_req(), PTP_EVENT_PORT, destination, (err) => {
 				if (err) {
 					this.emit('error', err)
 				} else {
@@ -793,6 +906,132 @@ export class PTPv1Client extends EventEmitter<PTPv1ClientEvents> {
 			this.syncTimeout = undefined
 			this.sync_change(false)
 		}, this.sync_receipt_timeout)
+	}
+
+	/**
+	 * Take this clock as the one to follow, abandoning any exchange in flight with the last.
+	 *
+	 * The offset is deliberately kept: it is this host's best estimate of PTP time and stays
+	 * closer to the truth than zero would while the new master's first exchange completes.
+	 */
+	private adoptMaster(source: string, address: string, buffer: Buffer): void {
+		this.ptpMaster = source
+		this.ptpMasterAddress = address
+		// Copied, not referenced: dgram reuses its receive buffer for the next datagram
+		this.ptpMasterUuid = Buffer.from(buffer.subarray(SOURCE_UUID_OFFSET, SOURCE_UUID_OFFSET + SOURCE_UUID_LENGTH))
+		// Half-finished timestamps belong to the clock that has just been dropped, and its
+		// sequence numbers mean nothing against the new one's
+		this.t1 = 0n
+		this.ts1 = 0n
+		this.resetMetrics()
+		this.unansweredDelayReqs = 0
+		this.sync_change(false)
+		this.emit('ptp_master_changed', this.ptpMaster, address, this.sync)
+	}
+
+	/**
+	 * Has the master we are following stopped transmitting for long enough to hand over?
+	 * Measured against the same receipt timeout that drops sync, so a handover cannot happen
+	 * while the incumbent is still considered present.
+	 */
+	private incumbentIsStale(): boolean {
+		const lastHeard = this.mastersSeen.get(this.ptpMaster)
+		if (lastHeard === undefined) return true
+		return Date.now() - lastHeard > this.sync_receipt_timeout
+	}
+
+	/**
+	 * Record a clock as sending Sync here, and re-evaluate whether the domain is contended.
+	 *
+	 * Contention is judged on what is transmitting *now*, not on everything ever seen: a
+	 * clean failover leaves two entries in the list but only one of them live, and reporting
+	 * that as contention would cry wolf on every handover.
+	 */
+	private noteMaster(source: string): void {
+		const known = this.mastersSeen.has(source)
+		this.mastersSeen.set(source, Date.now())
+		if (!known) this.emit('masters', [...this.mastersSeen.keys()])
+
+		const live = this.liveMasters()
+		const contending = live.length > 1
+		if (contending === this.contending) return
+		this.contending = contending
+		this.emit('master_contention_changed', contending, live)
+	}
+
+	/** The clocks that have sent Sync recently enough to still count as present */
+	private liveMasters(): string[] {
+		const cutoff = Date.now() - this.sync_receipt_timeout
+		return [...this.mastersSeen].filter(([, seen]) => seen > cutoff).map(([source]) => source)
+	}
+
+	/**
+	 * Record a Sync from the master and account for any that went missing before it.
+	 *
+	 * Loss is counted from gaps in the sequence number, which is the only evidence a passive
+	 * observer has that a message was sent at all. Resets on a master change: sequence
+	 * numbers are per port and mean nothing across two clocks.
+	 */
+	private noteSync(sequence: number): void {
+		this.syncWindow.add()
+		if (this.lastSyncSeq !== undefined) {
+			const missed = missedBetween(this.lastSyncSeq, sequence)
+			if (missed === undefined) {
+				// A repeat, a reordering, or a restart — re-base rather than count it
+				this.lastSyncSeq = sequence
+				this.emitMetrics()
+				return
+			}
+			if (missed > 0) {
+				this.syncLostTotal += missed
+				this.syncLostWindow.add(missed)
+			}
+		}
+		this.lastSyncSeq = sequence
+		this.emitMetrics()
+	}
+
+	/** Reset every measurement that belongs to the clock being left behind */
+	private resetMetrics(): void {
+		this.syncWindow.reset()
+		this.syncLostWindow.reset()
+		this.lastSyncSeq = undefined
+		this.syncLostTotal = 0
+	}
+
+	/**
+	 * Rates move on every Sync, which is up to 128 a second. Publishing that often would be
+	 * pointless churn, so it is throttled to once a second — still far faster than the
+	 * measurement window, and it keeps updating when nothing else is, which is exactly when
+	 * the loss figure matters.
+	 */
+	private emitMetrics(): void {
+		const now = Date.now()
+		if (now - this.lastMetricsEmit < 1000) return
+		this.lastMetricsEmit = now
+		this.emit('metrics_changed')
+	}
+
+	/**
+	 * Count a Delay_Req as outstanding, and say so once enough have gone unanswered.
+	 *
+	 * A master that never answers leaves the client permanently unsynced with nothing else to
+	 * show for it, so the condition is reported rather than left to be inferred from a clock
+	 * that simply does not lock.
+	 */
+	private noteDelayReqSent(): void {
+		this.unansweredDelayReqs++
+		if (this.delayResponding && this.unansweredDelayReqs >= UNANSWERED_DELAY_REQS) {
+			this.delayResponding = false
+			this.emit('delay_response_changed', false, this.unansweredDelayReqs)
+		}
+	}
+
+	private noteDelayRespReceived(): void {
+		this.unansweredDelayReqs = 0
+		if (this.delayResponding) return
+		this.delayResponding = true
+		this.emit('delay_response_changed', true, 0)
 	}
 
 	private addSubdomain(name: string): void {

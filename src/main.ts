@@ -84,7 +84,13 @@ export default class ModuleInstance extends InstanceBase<ModuleSchema> {
 						)
 						return
 					}
-					const client = new PTPv1Client(config.interface, subdomain.name, config.interval, subdomain.multicast)
+					const client = new PTPv1Client(
+						config.interface,
+						subdomain.name,
+						config.interval,
+						subdomain.multicast,
+						config.unicastDelayReq ?? false,
+					)
 					this.client = client
 					this.listenForV1ClientEvents(client)
 				} else {
@@ -96,6 +102,7 @@ export default class ModuleInstance extends InstanceBase<ModuleSchema> {
 						config.domain,
 						config.interval,
 						config.delayMechanism ?? 'auto',
+						config.unicastDelayReq ?? false,
 					)
 					this.client = client
 					this.listenForClientEvents(client)
@@ -113,7 +120,7 @@ export default class ModuleInstance extends InstanceBase<ModuleSchema> {
 
 	private listenForClientEvents(client: PTPv2Client): void {
 		client.on('ptp_master_changed', (ptp_master, master_address, sync) => {
-			this.log('info', `PTPv2 Master Changed: ${ptp_master} Address: ${master_address}`)
+			this.log('warn', `PTPv2 Master Changed: ${ptp_master} Address: ${master_address}`)
 			this.log(sync ? 'info' : 'warn', `PTP Sync Changed. ${sync ? 'Locked' : 'Unlocked'}`)
 			this.checkAllFeedbacks()
 			// A new master invalidates the time derived from the old one, which sharedValues
@@ -190,6 +197,14 @@ export default class ModuleInstance extends InstanceBase<ModuleSchema> {
 			this.log(sync ? 'info' : 'warn', `PTP Sync Changed. ${sync ? 'Locked' : 'Unlocked'}`)
 			this.checkAllFeedbacks()
 		})
+		client.on('domains', (domains) => {
+			// Traffic on a domain this connection is not listening to is the usual explanation
+			// for hearing nothing at all: the domain is simply set wrong
+			const found = [...domains]
+			this.log('debug', `PTP domains heard: ${found.join(', ')}`)
+			this.setVariableValues({ domainsFound: found })
+		})
+		this.listenForMasterContention(client)
 		client.on('error', (err) => {
 			this.statusManager.updateStatus(InstanceStatus.UnknownError, err.message)
 			// Error has no enumerable own properties, so JSON.stringify would render every
@@ -214,7 +229,7 @@ export default class ModuleInstance extends InstanceBase<ModuleSchema> {
 	 */
 	private listenForV1ClientEvents(client: PTPv1Client): void {
 		client.on('ptp_master_changed', (ptp_master, master_address, sync) => {
-			this.log('info', `PTPv1 Master Changed: ${ptp_master} Address: ${master_address}`)
+			this.log('warn', `PTPv1 Master Changed: ${ptp_master} Address: ${master_address}`)
 			this.log(sync ? 'info' : 'warn', `PTP Sync Changed. ${sync ? 'Locked' : 'Unlocked'}`)
 			this.checkAllFeedbacks()
 			this.setVariableValues(this.sharedValues())
@@ -238,6 +253,7 @@ export default class ModuleInstance extends InstanceBase<ModuleSchema> {
 			this.log('debug', `PTPv1 subdomains heard: ${found.join(', ')}`)
 			this.setVariableValues({ subdomainsFound: found })
 		})
+		this.listenForMasterContention(client)
 		client.on('error', (err) => {
 			this.statusManager.updateStatus(InstanceStatus.UnknownError, err.message)
 			this.log('warn', `Error: ${err.message}`)
@@ -249,6 +265,73 @@ export default class ModuleInstance extends InstanceBase<ModuleSchema> {
 		client.on('listening', (msg) => {
 			this.log('info', msg)
 			this.statusManager.updateStatus(InstanceStatus.Ok)
+		})
+	}
+
+	/**
+	 * Two clocks sending Sync on one domain is a split: each half of the network has elected
+	 * its own grandmaster, and the two are running free of one another. The module follows
+	 * one of them and says so, rather than flapping between them — but the condition is the
+	 * whole reason someone is looking at this module, so it is logged loudly and published.
+	 */
+	private listenForMasterContention(client: PTPv2Client | PTPv1Client): void {
+		client.on('delay_response_changed', (responding: boolean, unanswered: number) => {
+			if (responding) {
+				this.log('info', `Master is answering Delay Requests again`)
+			} else {
+				const destination = client.delay_req_destination
+				this.log(
+					'warn',
+					`Master has not answered the last ${unanswered} Delay Requests sent to ${destination}. ` +
+						`Without a response the clock cannot lock. ` +
+						(this.config?.unicastDelayReq
+							? `Delay Requests are already unicast, so the master itself is not responding — check that it permits them.`
+							: `Try enabling Unicast Delay Requests: if that works, the multicast group is being filtered rather than the master ignoring us.`),
+				)
+			}
+			this.setVariableValues({ delayResponding: responding })
+			this.checkAllFeedbacks()
+		})
+		client.on('path_delay_step', (from: bigint, to: bigint) => {
+			// An event, not a state: after the move there is no threshold it sits above or
+			// below, so this is logged rather than exposed as a feedback
+			const us = (ns: bigint) => (Number(ns) / 1000).toFixed(1)
+			this.log(
+				'warn',
+				`Path delay stepped from ${us(from)}us to ${us(to)}us. ` +
+					`A sustained change of this size is a route change or a newly asymmetric path, not measurement noise.`,
+			)
+		})
+		client.on('metrics_changed', () => {
+			// These are the figures that matter while nothing is working, so they cannot ride
+			// on a completed exchange the way the rest do
+			this.setVariableValues({
+				syncRate: client.sync_rate,
+				syncLossPercent: client.sync_loss_percent,
+				syncLost: client.sync_lost_total,
+				...(this.v2 ? { announceRate: this.v2.announce_rate } : {}),
+			})
+		})
+		client.on('masters', (masters: string[]) => {
+			this.log('debug', `Clocks seen sending Sync: ${masters.join(', ')}`)
+			this.setVariableValues({ mastersFound: masters })
+		})
+		client.on('master_contention_changed', (contending: boolean, masters: string[]) => {
+			if (contending) {
+				this.log(
+					'error',
+					`Multiple PTP masters on this ${this.config?.ptpVersion === 'v1' ? 'subdomain' : 'domain'}: ` +
+						`${masters.join(', ')}. The domain is split — each side has elected its own grandmaster, ` +
+						`so the two are not synchronised to each other. This connection is following ${this.client?.ptp_master[0]}.`,
+				)
+			} else {
+				this.log('info', `PTP master contention resolved. Following ${this.client?.ptp_master[0]}`)
+			}
+			this.setVariableValues({
+				masterContention: contending,
+				mastersLive: masters,
+			})
+			this.checkAllFeedbacks()
 		})
 	}
 
@@ -308,6 +391,14 @@ export default class ModuleInstance extends InstanceBase<ModuleSchema> {
 			ptpMasterMac: this.client.ptp_master_mac ?? '',
 			ptpMasterOui: this.client.ptp_master_oui,
 			ptpMasterVendor: this.client.ptp_master_vendor ?? '',
+			syncRate: this.client.sync_rate,
+			syncLossPercent: this.client.sync_loss_percent,
+			syncLost: this.client.sync_lost_total,
+			delayResponding: this.client.delay_responding,
+			delayReqDestination: this.client.delay_req_destination,
+			mastersFound: this.client.masters_found,
+			mastersLive: this.client.masters_live,
+			masterContention: this.client.master_contention,
 		}
 	}
 

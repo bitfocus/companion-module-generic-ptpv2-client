@@ -11,16 +11,30 @@ export type VariablesSchema = {
 	// Measurement quality
 	meanPathDelay: number | undefined
 	lastCorrection: number | undefined
+	// Observed from what arrives, not from what the master advertises
+	syncRate: number
+	announceRate: number
+	syncLossPercent: number
+	syncLost: number
 
 	// Delay mechanism. peerMeanPathDelay is the local link only — in a P2P domain the rest
 	// of the path arrives already summed in the Sync correction field.
 	delayMechanism: string
 	peerMeanPathDelay: number | undefined
 	peerDelayResponding: boolean
+	/** Whether the master is answering this client's Delay_Req */
+	delayResponding: boolean
+	/** Where Delay_Req is being sent: the master's address, or the multicast group */
+	delayReqDestination: string
 
 	// The port sending Sync — behind a boundary clock this is not the grandmaster
 	ptpMaster: string
 	ptpMasterAddress: string
+	/** Every clock heard sending Sync on this domain/subdomain, in the order first seen */
+	mastersFound: string[]
+	/** The clocks sending Sync right now — more than one means the domain is split */
+	mastersLive: string[]
+	masterContention: boolean
 	ptpMasterMac: string
 	ptpMasterOui: string
 	ptpMasterVendor: string
@@ -41,6 +55,8 @@ export type VariablesSchema = {
 	grandmasterPriority2: number | undefined
 	stepsRemoved: number | undefined
 	announceInterval: number | undefined
+	/** Every PTP domain heard on the wire, whether or not this connection is listening to it */
+	domainsFound: number[]
 	lastAnnounce: string
 	pathTrace: string
 	pathTraceHops: number | undefined
@@ -74,12 +90,20 @@ const sharedDefs: VariableDefs = {
 	ptpTimeNS: { name: 'PTP Time (ns)' },
 	ptpTime: { name: 'PTP Time' },
 	lastSync: { name: 'Last Sync Timestamp' },
+	syncRate: { name: 'Sync Messages Received (per second)' },
+	syncLossPercent: { name: 'Sync Messages Lost (%)' },
+	syncLost: { name: 'Sync Messages Lost (count)' },
+	delayResponding: { name: 'Master Answering Delay Requests' },
+	delayReqDestination: { name: 'Delay Request Destination' },
 
 	ptpMaster: { name: 'PTP Master (Clock Identity)' },
 	ptpMasterAddress: { name: 'PTP Master (Address)' },
 	ptpMasterMac: { name: 'PTP Master (MAC)' },
 	ptpMasterOui: { name: 'PTP Master (OUI)' },
 	ptpMasterVendor: { name: 'PTP Master (Manufacturer)' },
+	mastersFound: { name: 'Masters Seen (Clock Identities)' },
+	mastersLive: { name: 'Masters Transmitting Now' },
+	masterContention: { name: 'Multiple Masters Detected' },
 	ptpVersion: { name: 'PTP Version' },
 }
 
@@ -112,6 +136,8 @@ const v2Defs: VariableDefs = {
 	grandmasterPriority2: { name: 'Grandmaster Priority 2' },
 	stepsRemoved: { name: 'Steps Removed from Grandmaster' },
 	announceInterval: { name: 'Announce Interval (s)' },
+	announceRate: { name: 'Announce Messages Received (per second)' },
+	domainsFound: { name: 'PTP Domains Found' },
 	lastAnnounce: { name: 'Last Announce Timestamp' },
 	pathTrace: { name: 'Path Trace (Clock Identity Chain)' },
 	pathTraceHops: { name: 'Path Trace (Clocks in Path)' },

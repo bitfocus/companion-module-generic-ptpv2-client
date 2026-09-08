@@ -508,13 +508,16 @@ describe('event socket message handling', () => {
 		client.destroy()
 	})
 
-	it('re-emits ptp_master_changed when source clock identity changes', async () => {
+	it('keeps the master it has when a second clock also sends Sync', async () => {
+		// Two clocks sending Sync on one domain is a split, not a handover — following
+		// whichever spoke last would mix their timestamps and never lock
 		const client = await makeClient()
 		const spy = vi.fn()
 		client.on('ptp_master_changed', spy)
 		eventSocket().emit('message', makeSyncBuffer({ flags: 0x0200, source: 'aabbccddeeff0011' }), rinfo)
 		eventSocket().emit('message', makeSyncBuffer({ flags: 0x0200, source: '1122334455660099' }), rinfo)
-		expect(spy).toHaveBeenCalledTimes(2)
+		expect(spy).toHaveBeenCalledTimes(1)
+		expect(client.ptp_master[0]).toContain('aa-bb-cc-dd-ee-ff')
 		client.destroy()
 	})
 
@@ -1150,7 +1153,7 @@ describe('FIX: Delay_Req packet format', () => {
 // FIX: sync state transitions
 // ===========================================================================
 describe('FIX: sync_changed on master change', () => {
-	it('emits sync_changed false when the master changes while synced', async () => {
+	it('holds sync when a rival master appears alongside the one it is following', async () => {
 		const client = await makeClient('0.0.0.0', 0, 125)
 		eventSocket().emit('message', makeSyncBuffer({ flags: 0x0000, tsSecondsLow: 1_700_000_000 }), rinfo)
 		await new Promise<void>((r) => setImmediate(r))
@@ -1161,8 +1164,34 @@ describe('FIX: sync_changed on master change', () => {
 		client.on('sync_changed', spy)
 		eventSocket().emit('message', makeSyncBuffer({ flags: 0x0000, source: 'aabbccddeeff0011' }), rinfo)
 
-		expect(spy).toHaveBeenCalledWith(false)
+		// The rival is reported as contention, not acted on: a split domain must not knock
+		// this connection out of sync on every packet from the other side
+		expect(spy).not.toHaveBeenCalled()
+		expect(client.is_synced).toBe(true)
+		expect(client.master_contention).toBe(true)
+		client.destroy()
+	})
+
+	it('emits sync_changed false when the master is genuinely replaced', async () => {
+		vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date', 'hrtime'] })
+		const client = new PTPv2Client('0.0.0.0', 0, 125, 'e2e')
+		await vi.advanceTimersByTimeAsync(0)
+		await vi.advanceTimersByTimeAsync(0)
+		eventSocket().emit('message', makeSyncBuffer({ flags: 0x0000, tsSecondsLow: 1_700_000_000 }), rinfo)
+		await vi.advanceTimersByTimeAsync(0)
+		generalSocket().emit('message', makeDelayRespBuffer(client, { sequence: 1, tsSecondsLow: 1_700_000_000 }), rinfo)
+		expect(client.is_synced).toBe(true)
+
+		const spy = vi.fn()
+		client.on('ptp_master_changed', spy)
+		// The incumbent goes quiet for longer than its own receipt timeout, so the next clock
+		// to speak takes over — this is failover, not contention
+		await vi.advanceTimersByTimeAsync(client.sync_receipt_timeout + 1000)
 		expect(client.is_synced).toBe(false)
+		eventSocket().emit('message', makeSyncBuffer({ flags: 0x0000, source: 'aabbccddeeff0011' }), rinfo)
+		expect(spy).toHaveBeenCalledTimes(1)
+		expect(client.ptp_master[0]).toContain('aa-bb-cc-dd-ee-ff')
+		vi.useRealTimers()
 		client.destroy()
 	})
 })
@@ -1229,6 +1258,79 @@ describe('FIX: destroy with a pending Delay_Req', () => {
 		await new Promise<void>((r) => setImmediate(r))
 
 		expect(socket.send).not.toHaveBeenCalled()
+	})
+})
+
+// ===========================================================================
+// Delay request delivery and response
+// ===========================================================================
+describe('PTPv2 delay requests', () => {
+	it('sends to the primary multicast group by default', async () => {
+		const client = await makeClient('0.0.0.0', 0, 125)
+		eventSocket().emit('message', makeSyncBuffer({ flags: 0x0000 }), rinfo)
+		await new Promise<void>((r) => setImmediate(r))
+		expect(eventSocket().send).toHaveBeenCalledWith(expect.anything(), 319, '224.0.1.129', expect.anything())
+		client.destroy()
+	})
+
+	it('sends straight to the master when unicast is enabled', async () => {
+		const client = new PTPv2Client('0.0.0.0', 0, 125, 'e2e', true)
+		await new Promise<void>((r) => setImmediate(r))
+		await new Promise<void>((r) => setImmediate(r))
+		eventSocket().emit('message', makeSyncBuffer({ flags: 0x0000 }), rinfo)
+		await new Promise<void>((r) => setImmediate(r))
+		expect(eventSocket().send).toHaveBeenCalledWith(expect.anything(), 319, rinfo.address, expect.anything())
+		expect(client.delay_req_destination).toBe(rinfo.address)
+		client.destroy()
+	})
+
+	it('sets unicastFlag on a Delay_Req addressed to the master', async () => {
+		// IEEE 1588-2008 §13.3.2.6 — a message sent to a unicast address says so, and a
+		// master is entitled to answer to the group otherwise
+		const client = new PTPv2Client('0.0.0.0', 0, 125, 'e2e', true)
+		await new Promise<void>((r) => setImmediate(r))
+		await new Promise<void>((r) => setImmediate(r))
+		eventSocket().emit('message', makeSyncBuffer({ flags: 0x0000 }), rinfo)
+		await new Promise<void>((r) => setImmediate(r))
+		const sent: Buffer = eventSocket().send.mock.calls[0][0]
+		expect(sent.readUInt16BE(6) & 0x0400).toBe(0x0400)
+		client.destroy()
+	})
+
+	it('leaves unicastFlag clear on a multicast Delay_Req', async () => {
+		const client = await makeClient('0.0.0.0', 0, 125)
+		eventSocket().emit('message', makeSyncBuffer({ flags: 0x0000 }), rinfo)
+		await new Promise<void>((r) => setImmediate(r))
+		const sent: Buffer = eventSocket().send.mock.calls[0][0]
+		expect(sent.readUInt16BE(6) & 0x0400).toBe(0)
+		client.destroy()
+	})
+
+	it('reports the master as unresponsive after three unanswered requests', async () => {
+		vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'setInterval', 'clearInterval', 'Date', 'hrtime'] })
+		const client = new PTPv2Client('0.0.0.0', 0, 125, 'e2e')
+		await vi.advanceTimersByTimeAsync(0)
+		await vi.advanceTimersByTimeAsync(0)
+		const changed = vi.fn()
+		client.on('delay_response_changed', changed)
+		for (let i = 1; i <= 3; i++) {
+			eventSocket().emit('message', makeSyncBuffer({ flags: 0x0000, sequence: i }), rinfo)
+			await new Promise<void>((r) => setImmediate(r))
+			vi.advanceTimersByTime(200)
+		}
+		expect(client.delay_responding).toBe(false)
+		expect(changed).toHaveBeenCalledWith(false, 3)
+		vi.useRealTimers()
+		client.destroy()
+	})
+
+	it('is not raised for peer to peer, which reports its neighbour separately', async () => {
+		const client = await makeClient('0.0.0.0', 0, 125, 'p2p')
+		eventSocket().emit('message', makeSyncBuffer({ flags: 0x0000 }), rinfo)
+		await new Promise<void>((r) => setImmediate(r))
+		// P2P sends Pdelay_Req, never Delay_Req, so nothing is outstanding to go unanswered
+		expect(client.delay_responding).toBe(true)
+		client.destroy()
 	})
 })
 

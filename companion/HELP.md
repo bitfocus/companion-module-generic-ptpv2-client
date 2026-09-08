@@ -111,6 +111,16 @@ That inference is one-sided. Peer delay is **link-local** — sent to 224.0.0.10
 - **PTP Master** is the port that sent the Sync message, shown as `clock-identity:portNumber`. Behind a boundary clock this is the boundary clock, not the source of time.
 - **Grandmaster** is the actual source of time, taken from Announce messages. **Steps Removed** gives the number of boundary clocks between this host and it — `0` means the grandmaster is being heard directly.
 
+### Running more than one connection on the same interface
+
+Several connections can watch one interface at once — PTPv1 and PTPv2 together, two PTPv2 domains, or two PTPv1 subdomains. The sockets are shared, multicast is delivered to every connection bound to them, and each one filters the traffic down to its own protocol, domain or subdomain.
+
+Each connection identifies itself to the master by a clock identity and a port number. The clock identity comes from the interface, so connections watching the same one share it; the port number is picked per connection so that their Delay Requests stay distinguishable. Without that they would accept each other's replies and each report a time built from another connection's timestamps.
+
+> **Do not enable Unicast Delay Requests on more than one connection per interface.** Multicast is delivered to every connection sharing a socket, but a unicast reply is delivered to only one of them. The others never see their Delay Response and never lock. Leave it off where several connections share an interface, or enable it on one of them only.
+
+Note also that each connection runs its own delay exchange, so two connections send twice the requests of one.
+
 ### Path delay steps
 
 A route change, or a path that becomes asymmetric, moves the measured delay to a different plateau. That is an event rather than a state — afterwards there is no threshold it sits above or below — so it is logged at warning level rather than offered as a feedback. `$(ptp:meanPathDelay)` continues to report the value itself.
@@ -134,6 +144,8 @@ By default a Delay_Req goes to the multicast group, which means every device on 
 `$(ptp:delayReqDestination)` reports where requests are actually going. Multicast is used until the first Sync arrives, because until then there is no master address to send to.
 
 It is also a diagnostic. If multicast requests go unanswered but unicast ones succeed, the master is fine and the group is being filtered somewhere in between — a different fault, and a different fix, from a master that is ignoring the module.
+
+Only one connection per interface may use it — see above.
 
 ### Measuring what arrives
 

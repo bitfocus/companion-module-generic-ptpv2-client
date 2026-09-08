@@ -214,6 +214,22 @@ const readPathTrace = (buffer: Buffer): string[] => {
 }
 
 /**
+ * A PTP portNumber for this client, chosen at random.
+ *
+ * The clockIdentity is derived from the NIC, so two connections monitoring the same
+ * interface share it — and Companion runs each connection in its own process, so a counter
+ * could not tell them apart either. The port number is what keeps their Delay_Req identities
+ * distinct. Without it both would accept the other's Delay_Resp, since a response is matched
+ * on identity and sequence and two clients starting from zero collide constantly; each would
+ * then pair the master's receive timestamp with its own send timestamp and report a time
+ * that is quietly wrong.
+ *
+ * Two ports of one clock is precisely what IEEE 1588 means by a port number, so this is the
+ * field the standard intends for the purpose. 0 is reserved, hence the range 1 to 65535.
+ */
+const randomPortNumber = (): number => (randomBytes(2).readUInt16BE(0) % 0xffff) + 1
+
+/**
  * Recover the MAC from a clockIdentity, where the identity was derived from one.
  * IEEE 1588 §7.5.2.2.2 builds an EUI-64 from an EUI-48 by inserting FF FE in the middle, and
  * that marker at bytes 3–4 is what makes it reversible. An identity that was configured or
@@ -611,7 +627,7 @@ export class PTPv2Client extends EventEmitter<PTPv2ClientEvents> {
 
 		this.portIdentity = Buffer.alloc(PORT_IDENTITY_LENGTH)
 		clockIdentityForAddress(this.addr).copy(this.portIdentity, 0)
-		this.portIdentity.writeUInt16BE(1, 8) // portNumber; a single-port client is always 1
+		this.portIdentity.writeUInt16BE(randomPortNumber(), 8)
 
 		this.ptpClientEvent.on('listening', () => {
 			this.joinMulticast(this.ptpClientEvent)
@@ -1500,6 +1516,11 @@ export class PTPv2Client extends EventEmitter<PTPv2ClientEvents> {
 	/** Whether more than one clock is sending Sync on this domain right now */
 	public get master_contention(): boolean {
 		return this.contending
+	}
+
+	/** The portNumber stamped on this client's Delay_Req, distinct per instance */
+	public get source_port_number(): number {
+		return this.portIdentity.readUInt16BE(8)
 	}
 
 	/** Sync messages per second actually arriving from the master */

@@ -445,6 +445,64 @@ describe('PTPv1 subdomain handling', () => {
 })
 
 // ===========================================================================
+// Sharing a NIC with other connections
+// ===========================================================================
+/**
+ * Several Companion connections can watch one interface — PTPv1 and PTPv2 together, or two
+ * subdomains. The sockets bind with SO_REUSEADDR and multicast is delivered to every one of
+ * them, so each connection sees all the traffic and has to reject what is not its own.
+ */
+describe('PTPv1 sharing an interface', () => {
+	/** A PTPv2 Sync as it appears on 224.0.1.129, which PTPv1 joins as well */
+	const v2Packet = (domain: number): Buffer => {
+		const buf = Buffer.alloc(44)
+		buf.writeUInt8(0x00, 0) // messageType Sync
+		buf.writeUInt8(0x02, 1) // versionPTP 2
+		buf.writeUInt16BE(44, 2)
+		buf.writeUInt8(domain, 4)
+		return buf
+	}
+
+	it.each([0, 95, 127, 200])('ignores a PTPv2 Sync on domain %i', async (domain) => {
+		const client = await makeClient()
+		eventSocket().emit('message', v2Packet(domain), rinfo)
+		expect(client.ptp_master[0]).toBe('')
+		expect(client.is_synced).toBe(false)
+		client.destroy()
+	})
+
+	it.each([95, 127, 200])('keeps a PTPv2 domain %i out of the discovered subdomains', async (domain) => {
+		// Bytes 4-19 of a PTPv2 header are the domain, flags and correction field. Read as a
+		// PTPv1 subdomain name they decode to a one-character string, which would appear in
+		// the list a Dante Domain Manager subdomain is meant to be discovered from.
+		const client = await makeClient()
+		eventSocket().emit('message', v2Packet(domain), rinfo)
+		generalSocket().emit('message', v2Packet(domain), rinfo)
+		expect([...client.subdomains]).toEqual([])
+		client.destroy()
+	})
+
+	it('gives each client on the same NIC a distinct port number', async () => {
+		// The uuid comes from the interface, so two connections watching one NIC share it.
+		// Only the port number can tell their Delay_Req apart, and without that each would
+		// accept the other's Delay_Resp and report a time built from mismatched timestamps.
+		const clients = await Promise.all([makeClient(), makeClient(), makeClient(), makeClient()])
+		const ports = clients.map((c) => c.source_port_id)
+		expect(new Set(ports).size).toBe(ports.length)
+		for (const port of ports) expect(port).toBeGreaterThanOrEqual(1)
+		for (const port of ports) expect(port).toBeLessThanOrEqual(0xffff)
+		clients.forEach((c) => c.destroy())
+	})
+
+	it('stamps that port number on the Delay_Req it sends', async () => {
+		const client = await makeClient()
+		await syncAndRequest()
+		expect(eventSocket().send.mock.calls[0][0].readUInt16BE(28)).toBe(client.source_port_id)
+		client.destroy()
+	})
+})
+
+// ===========================================================================
 // Delay request delivery and response
 // ===========================================================================
 /**
@@ -1268,7 +1326,12 @@ describe('PTPv1 Delay_Resp ownership', () => {
 	it('ignores a Delay_Resp for another port of the same clock', async () => {
 		const client = await makeClient()
 		const seq = await completeExchange()
-		generalSocket().emit('message', makeDelayResp({ uuid: client.source_uuid, portId: 99, sequence: seq }), rinfo)
+		const otherPort = (client.source_port_id % 0xffff) + 1 // never this client's own
+		generalSocket().emit(
+			'message',
+			makeDelayResp({ uuid: client.source_uuid, portId: otherPort, sequence: seq }),
+			rinfo,
+		)
 		expect(client.is_synced).toBe(false)
 		client.destroy()
 	})

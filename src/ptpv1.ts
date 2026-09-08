@@ -135,6 +135,9 @@ const FLAG_ASSIST = 0x0008
 // ---------------------------------------------------------------------------
 
 const HEADER_LENGTH = 40
+/** versionPTP, bytes 0-1. IEEE 1588-2002 is version 1; PTPv2 carries 2 here. */
+const VERSION_PTP_OFFSET = 0
+const PTPV1_VERSION = 1
 const SUBDOMAIN_OFFSET = 4
 const SUBDOMAIN_LENGTH = 16
 const SUBDOMAIN_END = SUBDOMAIN_OFFSET + SUBDOMAIN_LENGTH
@@ -262,6 +265,22 @@ const decodeSubdomain = (buffer: Buffer): string => {
 }
 
 /**
+ * A PTP portNumber for this client, chosen at random.
+ *
+ * The clockIdentity is derived from the NIC, so two connections monitoring the same
+ * interface share it — and Companion runs each connection in its own process, so a counter
+ * could not tell them apart either. The port number is what keeps their Delay_Req identities
+ * distinct. Without it both would accept the other's Delay_Resp, since a response is matched
+ * on identity and sequence and two clients starting from zero collide constantly; each would
+ * then pair the master's receive timestamp with its own send timestamp and report a time
+ * that is quietly wrong.
+ *
+ * Two ports of one clock is precisely what IEEE 1588 means by a port number, so this is the
+ * field the standard intends for the purpose. 0 is reserved, hence the range 1 to 65535.
+ */
+const randomPortNumber = (): number => (randomBytes(2).readUInt16BE(0) % 0xffff) + 1
+
+/**
  * Format a PTPv1 source identity as "uuid0-uuid1-...-uuid5:portId"
  */
 const formatSourceId = (buffer: Buffer): string => {
@@ -379,7 +398,7 @@ export class PTPv1Client extends EventEmitter<PTPv1ClientEvents> {
 	// Our own identity: the 6-byte sourceUuid and portId we stamp on every Delay_Req, and
 	// which the master echoes back so we can tell our own Delay_Resp from another slave's
 	private readonly sourceUuid: Buffer
-	private readonly sourcePortId: number = 1
+	private readonly sourcePortId: number = randomPortNumber()
 
 	// sockets
 	private ptpClientEvent = dgram.createSocket({ type: 'udp4', reuseAddr: true })
@@ -487,6 +506,12 @@ export class PTPv1Client extends EventEmitter<PTPv1ClientEvents> {
 
 			if (buffer.length < HEADER_LENGTH) return
 
+			// PTPv1 shares 224.0.1.129 with PTPv2, so v2 traffic arrives here too. Rejecting it
+			// on the version field rather than leaving the subdomain compare to do it by
+			// accident also keeps it out of the discovered-subdomain list, where a v2 domain
+			// byte would otherwise surface as a one-character subdomain name.
+			if (buffer.readUInt16BE(VERSION_PTP_OFFSET) !== PTPV1_VERSION) return
+
 			const control = buffer.readUInt8(CONTROL_OFFSET)
 			const sequence = buffer.readUInt16BE(SEQUENCE_OFFSET)
 			const flags = buffer.readUInt16BE(FLAGS_OFFSET)
@@ -547,6 +572,8 @@ export class PTPv1Client extends EventEmitter<PTPv1ClientEvents> {
 		// -----------------------------------------------------------------------
 		this.ptpClientGeneral.on('message', (buffer, _rinfo): void => {
 			if (buffer.length < HEADER_LENGTH) return
+
+			if (buffer.readUInt16BE(VERSION_PTP_OFFSET) !== PTPV1_VERSION) return
 
 			const control = buffer.readUInt8(CONTROL_OFFSET)
 

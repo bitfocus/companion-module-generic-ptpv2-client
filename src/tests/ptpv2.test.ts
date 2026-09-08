@@ -139,11 +139,14 @@ const makeFollowUpBuffer = (opts: Parameters<typeof makeSyncBuffer>[0] = {}) => 
  * that isn't stamped with its own, so tests must supply the client the response is for.
  */
 const makeDelayRespBuffer = (
-	requester: { clock_identity: string } | undefined,
+	requester: { clock_identity: string; source_port_number: number } | undefined,
 	opts: Parameters<typeof makeSyncBuffer>[0] = {},
 ): Buffer => {
 	const buf = makeSyncBuffer({ ...opts, type: 0x09, length: 54 })
-	if (requester) Buffer.from(requester.clock_identity + '0001', 'hex').copy(buf, 44)
+	if (requester) {
+		Buffer.from(requester.clock_identity, 'hex').copy(buf, 44)
+		buf.writeUInt16BE(requester.source_port_number, 52)
+	}
 	return buf
 }
 
@@ -160,20 +163,26 @@ const makePdelayReqBuffer = (opts: Parameters<typeof makeSyncBuffer>[0] = {}) =>
  * ignores any response not stamped with its own.
  */
 const makePdelayRespBuffer = (
-	requester: { clock_identity: string } | undefined,
+	requester: { clock_identity: string; source_port_number: number } | undefined,
 	opts: Parameters<typeof makeSyncBuffer>[0] = {},
 ): Buffer => {
 	const buf = makeSyncBuffer({ ...opts, type: 0x03, length: 54 })
-	if (requester) Buffer.from(requester.clock_identity + '0001', 'hex').copy(buf, 44)
+	if (requester) {
+		Buffer.from(requester.clock_identity, 'hex').copy(buf, 44)
+		buf.writeUInt16BE(requester.source_port_number, 52)
+	}
 	return buf
 }
 
 const makePdelayFollowUpBuffer = (
-	requester: { clock_identity: string } | undefined,
+	requester: { clock_identity: string; source_port_number: number } | undefined,
 	opts: Parameters<typeof makeSyncBuffer>[0] = {},
 ): Buffer => {
 	const buf = makeSyncBuffer({ ...opts, type: 0x0a, length: 54 })
-	if (requester) Buffer.from(requester.clock_identity + '0001', 'hex').copy(buf, 44)
+	if (requester) {
+		Buffer.from(requester.clock_identity, 'hex').copy(buf, 44)
+		buf.writeUInt16BE(requester.source_port_number, 52)
+	}
 	return buf
 }
 
@@ -1053,7 +1062,10 @@ describe('FIX: Delay_Resp addressed to another slave', () => {
 		// Sequence ids collide across slaves, so the id alone cannot identify ours.
 		generalSocket().emit(
 			'message',
-			makeDelayRespBuffer({ clock_identity: 'deadbeefdeadbeef' }, { sequence: 1, tsSecondsLow: 1_900_000_000 }),
+			makeDelayRespBuffer(
+				{ clock_identity: 'deadbeefdeadbeef', source_port_number: 1 },
+				{ sequence: 1, tsSecondsLow: 1_900_000_000 },
+			),
 			rinfo,
 		)
 
@@ -1136,7 +1148,7 @@ describe('FIX: Delay_Req packet format', () => {
 		const client = await makeClient('0.0.0.0', 0, 125)
 		const buf = await sentDelayReq()
 		expect(buf.toString('hex', 20, 28)).toBe(client.clock_identity)
-		expect(buf.readUInt16BE(28)).toBe(1) // portNumber
+		expect(buf.readUInt16BE(28)).toBe(client.source_port_number) // portNumber, per instance
 		client.destroy()
 	})
 
@@ -1258,6 +1270,34 @@ describe('FIX: destroy with a pending Delay_Req', () => {
 		await new Promise<void>((r) => setImmediate(r))
 
 		expect(socket.send).not.toHaveBeenCalled()
+	})
+})
+
+// ===========================================================================
+// Sharing a NIC with other connections
+// ===========================================================================
+describe('PTPv2 sharing an interface', () => {
+	it('gives each client on the same NIC a distinct port number', async () => {
+		// The clockIdentity comes from the interface, so connections watching one NIC share
+		// it. Only the port number keeps their Delay_Req identities apart.
+		const clients = await Promise.all([makeClient(), makeClient(), makeClient(), makeClient()])
+		const ports = clients.map((c) => c.source_port_number)
+		expect(new Set(ports).size).toBe(ports.length)
+		expect(new Set(clients.map((c) => c.clock_identity)).size).toBe(1) // same NIC, same identity
+		clients.forEach((c) => c.destroy())
+	})
+
+	it('ignores a Delay_Resp addressed to another port of the same clock', async () => {
+		const client = await makeClient('0.0.0.0', 0, 125)
+		eventSocket().emit('message', makeSyncBuffer({ flags: 0x0000, tsSecondsLow: 1_700_000_000 }), rinfo)
+		await new Promise<void>((r) => setImmediate(r))
+		const other = {
+			clock_identity: client.clock_identity,
+			source_port_number: (client.source_port_number % 0xffff) + 1,
+		}
+		generalSocket().emit('message', makeDelayRespBuffer(other, { sequence: 1, tsSecondsLow: 1_700_000_000 }), rinfo)
+		expect(client.is_synced).toBe(false)
+		client.destroy()
 	})
 })
 
@@ -2533,7 +2573,10 @@ describe('delay mechanism – peer to peer', () => {
 		await syncAndRequest()
 		eventSocket().emit(
 			'message',
-			makePdelayRespBuffer({ clock_identity: 'ffeeddccbbaa9988' }, { sequence: sentSeq(), flags: 0x0000 }),
+			makePdelayRespBuffer(
+				{ clock_identity: 'ffeeddccbbaa9988', source_port_number: 1 },
+				{ sequence: sentSeq(), flags: 0x0000 },
+			),
 			rinfo,
 		)
 		expect(client.peer_responding).toBe(false)

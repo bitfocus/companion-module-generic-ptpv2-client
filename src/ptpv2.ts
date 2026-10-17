@@ -524,8 +524,17 @@ export class PTPv2Client extends EventEmitter<PTPv2ClientEvents> {
 	//vars — all times are nanoseconds. t1/ts2 come from the master, ts1/t2 are local.
 	private t1: bigint = 0n // Sync transmit time at the master
 	private ts1: bigint = 0n // Sync receive time here
-	private t2: bigint = 0n // Delay_Req transmit time here
-	private ts2: bigint = 0n // Delay_Req receive time at the master
+	/**
+	 * The half of the measurement already known when a Delay_Req goes out, carried with the
+	 * exchange rather than read back from the fields above.
+	 *
+	 * ts1 and t1 belong to one particular Sync, but the master keeps sending Syncs while the
+	 * Delay_Resp is in flight and each one overwrites them. Reading them back when the
+	 * response finally arrives pairs this exchange's t1 with the receive time of a later
+	 * Sync, and both the offset and the path delay come out wrong by half the gap between the
+	 * two — 62ms on a clock sending eight Sync a second, reported as a confident lock.
+	 */
+	private pending: { seq: number; ts1: bigint; t1: bigint; t2: bigint } | undefined = undefined
 	private offset: bigint = 0n // local clock − ptp time
 	private syncCorrection: bigint = 0n // correctionField of the Sync awaiting its Follow_Up
 	private meanPathDelay: bigint = 0n
@@ -784,14 +793,19 @@ export class PTPv2Client extends EventEmitter<PTPv2ClientEvents> {
 				this.t1 = readPtpTimestamp(buffer) + this.syncCorrection + readCorrectionField(buffer)
 
 				this.completeSyncMeasurement()
-			} else if (type == MSG_DELAY_RESP && this.req_seq == sequence && this.isOurResponse(buffer)) {
+			} else if (type == MSG_DELAY_RESP && this.pending?.seq === sequence && this.isOurResponse(buffer)) {
+				const pending = this.pending
+				// One response per request: a duplicate must not fold the same measurement in
+				// a second time
+				this.pending = undefined
+
 				//delay_rsp msg
-				this.ts2 = readPtpTimestamp(buffer) - readCorrectionField(buffer)
+				const ts2 = readPtpTimestamp(buffer) - readCorrectionField(buffer)
 
 				// offset = ((t2 − t1) − (t4 − t3)) / 2, in this class's naming
 				// ((ts1 − t1) − (ts2 − t2)) / 2. ts1 and t2 are already offset-corrected, so
 				// this is the residual error and accumulates onto the running offset.
-				const correction = (this.ts1 - this.t1 - (this.ts2 - this.t2)) / 2n
+				const correction = (pending.ts1 - pending.t1 - (ts2 - pending.t2)) / 2n
 				// The first exchange carries the entire difference between the local timebase
 				// and the PTP epoch (~1.7e18ns). That is the initial acquisition, not clock
 				// drift, so it is not reported as a correction.
@@ -801,7 +815,7 @@ export class PTPv2Client extends EventEmitter<PTPv2ClientEvents> {
 
 				// The other half of the same measurement: ((t2 − t1) + (t4 − t3)) / 2.
 				// Rising path delay is how a congested or asymmetric link shows up.
-				this.meanPathDelay = (this.ts1 - this.t1 + (this.ts2 - this.t2)) / 2n
+				this.meanPathDelay = (pending.ts1 - pending.t1 + (ts2 - pending.t2)) / 2n
 				this.notePathDelay(this.meanPathDelay)
 
 				this.noteDelayRespReceived()
@@ -1029,16 +1043,21 @@ export class PTPv2Client extends EventEmitter<PTPv2ClientEvents> {
 		this.noteDelayReqSent()
 		// Unicast keeps this module's Delay_Req off every other device on the domain. It needs
 		// an address, so the group is still used until a master has been heard from.
+		// Taken now, while they still describe the Sync this exchange is measuring
+		const ts1 = this.ts1
+		const t1 = this.t1
 		const unicast = this.unicastDelayReq && this.ptpMasterAddress !== ''
 		const destination = unicast ? this.ptpMasterAddress : PTP_PRIMARY_MULTICAST
 		setImmediate(() => {
 			if (this.destroyed) return
-			this.ptpClientEvent.send(this.ptp_delay_req(unicast), PTP_EVENT_PORT, destination, (err, _bytes) => {
+			const request = this.ptp_delay_req(unicast)
+			const seq = this.req_seq
+			this.ptpClientEvent.send(request, PTP_EVENT_PORT, destination, (err, _bytes) => {
 				if (err) {
 					this.emit('error', err)
 				} else {
 					// only capture t2 after the packet has actually been sent
-					this.t2 = this.correctedTime()
+					this.pending = { seq, ts1, t1, t2: this.correctedTime() }
 				}
 			})
 		})
@@ -1172,6 +1191,7 @@ export class PTPv2Client extends EventEmitter<PTPv2ClientEvents> {
 		this.resetMetrics()
 		this.pathDelayStep.reset()
 		this.unansweredDelayReqs = 0
+		this.pending = undefined
 		// Route through sync_change so listeners see the transition
 		this.sync_change(false)
 		this.emit('ptp_master_changed', this.ptpMaster, address, this.sync)

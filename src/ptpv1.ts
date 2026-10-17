@@ -407,8 +407,17 @@ export class PTPv1Client extends EventEmitter<PTPv1ClientEvents> {
 	// timing vars — all nanoseconds. t1/ts2 come from the master, ts1/t2 are local.
 	private t1: bigint = 0n // master send timestamp (from Sync or Follow_Up)
 	private ts1: bigint = 0n // local receive timestamp of Sync
-	private t2: bigint = 0n // local send timestamp of Delay_Req
-	private ts2: bigint = 0n // master receive timestamp of Delay_Req (from Delay_Resp)
+	/**
+	 * The half of the measurement already known when a Delay_Req goes out, carried with the
+	 * exchange rather than read back from the fields above.
+	 *
+	 * ts1 and t1 belong to one particular Sync, but the master keeps sending Syncs while the
+	 * Delay_Resp is in flight and each one overwrites them. Reading them back when the
+	 * response finally arrives pairs this exchange's t1 with the receive time of a later
+	 * Sync, and the offset comes out wrong by half the gap between the two — 125ms on a clock
+	 * sending four Sync a second, reported as a confident lock.
+	 */
+	private pending: { seq: number; ts1: bigint; t1: bigint; t2: bigint } | undefined = undefined
 	private offset: bigint = 0n // local clock − ptp time
 	private sync_seq: number = 0
 	private req_seq: number = 0
@@ -609,15 +618,20 @@ export class PTPv1Client extends EventEmitter<PTPv1ClientEvents> {
 				// answer it and every answer carries our requester fields. isOurDelayResp only
 				// proves the response is addressed to us, not that it came from our master.
 				if (formatSourceId(buffer) !== this.ptpMaster) return
-				if (!this.isOurDelayResp(buffer)) return
+				const pending = this.pending
+				if (pending === undefined) return
+				if (!this.isOurDelayResp(buffer, pending.seq)) return
+				// One response per request: a duplicate must not fold the same measurement in
+				// a second time
+				this.pending = undefined
 
 				// The master's receive timestamp for our Delay_Req
-				this.ts2 = readPtpTimestamp(buffer, DR_TIMESTAMP_OFFSET)
+				const ts2 = readPtpTimestamp(buffer, DR_TIMESTAMP_OFFSET)
 
 				// offset = ((t2 − t1) − (t4 − t3)) / 2, in this class's naming
 				// ((ts1 − t1) − (ts2 − t2)) / 2. ts1 and t2 are already offset-corrected, so
 				// this is the residual error and accumulates onto the running offset.
-				const correction = (this.ts1 - this.t1 - (this.ts2 - this.t2)) / 2n
+				const correction = (pending.ts1 - pending.t1 - (ts2 - pending.t2)) / 2n
 				this.offset += correction
 
 				this.noteDelayRespReceived()
@@ -849,8 +863,8 @@ export class PTPv1Client extends EventEmitter<PTPv1ClientEvents> {
 	 * sequenceId belongs to the master, not to the exchange, so matching on that would accept
 	 * any slave's response that happened to collide.
 	 */
-	private isOurDelayResp(buffer: Buffer): boolean {
-		if (buffer.readUInt16BE(DR_REQUESTING_SEQUENCE_OFFSET) !== this.req_seq) return false
+	private isOurDelayResp(buffer: Buffer, sequence: number): boolean {
+		if (buffer.readUInt16BE(DR_REQUESTING_SEQUENCE_OFFSET) !== sequence) return false
 		if (buffer.readUInt16BE(DR_REQUESTING_PORT_ID_OFFSET) !== this.sourcePortId) return false
 		return (
 			buffer.compare(
@@ -880,18 +894,23 @@ export class PTPv1Client extends EventEmitter<PTPv1ClientEvents> {
 	private sendDelayReq(): void {
 		this.lastRequest = Date.now()
 		this.noteDelayReqSent()
+		// Taken now, while they still describe the Sync this exchange is measuring
+		const ts1 = this.ts1
+		const t1 = this.t1
 		// Unicast keeps this module's Delay_Req off every other device on the network, which
 		// is why Dante offers the same option. It needs an address, so the multicast group is
 		// still used until a master has been heard from.
 		const destination = this.unicastDelayReq && this.ptpMasterAddress !== '' ? this.ptpMasterAddress : this.multicast
 		setImmediate(() => {
 			if (this.destroyed) return
-			this.ptpClientEvent.send(this.ptp_delay_req(), PTP_EVENT_PORT, destination, (err) => {
+			const request = this.ptp_delay_req()
+			const seq = this.req_seq
+			this.ptpClientEvent.send(request, PTP_EVENT_PORT, destination, (err) => {
 				if (err) {
 					this.emit('error', err)
 				} else {
 					// only capture t2 after the packet has actually been sent
-					this.t2 = this.correctedTime()
+					this.pending = { seq, ts1, t1, t2: this.correctedTime() }
 				}
 			})
 		})
@@ -952,6 +971,7 @@ export class PTPv1Client extends EventEmitter<PTPv1ClientEvents> {
 		this.ts1 = 0n
 		this.resetMetrics()
 		this.unansweredDelayReqs = 0
+		this.pending = undefined
 		this.sync_change(false)
 		this.emit('ptp_master_changed', this.ptpMaster, address, this.sync)
 	}

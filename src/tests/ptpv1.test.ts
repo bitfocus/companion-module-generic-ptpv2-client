@@ -445,6 +445,72 @@ describe('PTPv1 subdomain handling', () => {
 })
 
 // ===========================================================================
+// Late Delay_Resp
+// ===========================================================================
+/**
+ * ts1 is the local receive time of the Sync, and it is not read until the Delay_Resp
+ * completes the exchange. Any Sync arriving in that window must not overwrite it, or this
+ * master's t1 ends up paired with the receive time of a later Sync and the offset comes out
+ * wrong by half the gap between them — which on a clock sending four Sync a second is 125ms,
+ * reported as a confident lock.
+ */
+describe('PTPv1 Delay_Resp arriving after the next Sync', () => {
+	const MASTER_SECONDS = 1_700_000_000
+	const MASTER_NS = BigInt(MASTER_SECONDS) * 1_000_000_000n
+	const GAP_MS = 200
+
+	beforeEach(() => {
+		vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'setInterval', 'clearInterval', 'Date', 'hrtime'] })
+	})
+	afterEach(() => {
+		vi.useRealTimers()
+	})
+
+	it('still measures against the Sync the exchange belongs to', async () => {
+		const client = new PTPv1Client('0.0.0.0', '_DFLT', 125)
+		await new Promise<void>((r) => setImmediate(r))
+		await new Promise<void>((r) => setImmediate(r))
+
+		// Two-step exchange: the Follow_Up carries t1 and triggers the Delay_Req
+		eventSocket().emit('message', makeSync({ flags: FLAG_ASSIST, sequence: 1 }), rinfo)
+		generalSocket().emit('message', makeFollowUp({ sequence: 1, tsSeconds: MASTER_SECONDS }), rinfo)
+		await new Promise<void>((r) => setImmediate(r))
+		const seq = eventSocket().send.mock.calls[0][0].readUInt16BE(30)
+
+		// The master keeps sending Sync while our Delay_Resp is still in flight
+		vi.advanceTimersByTime(GAP_MS)
+		eventSocket().emit('message', makeSync({ flags: FLAG_ASSIST, sequence: 2 }), rinfo)
+		generalSocket().emit('message', respondTo(client, seq, { tsSeconds: MASTER_SECONDS }), rinfo)
+
+		// The local clock has moved GAP_MS since the Sync this exchange measured, so PTP time
+		// is that far past the master's timestamp. Taking ts1 from Sync 2 would halve it.
+		expect(client.ptp_time_n).toBe(MASTER_NS + BigInt(GAP_MS) * 1_000_000n)
+		client.destroy()
+	})
+
+	it('folds a duplicated Delay_Resp in once, not twice', async () => {
+		// A response matched only on sequence is accepted as often as it arrives, and the
+		// correction is computed from fixed values — so applying it twice doubles it. On the
+		// first exchange that correction is the entire gap to the PTP epoch.
+		const client = new PTPv1Client('0.0.0.0', '_DFLT', 125)
+		await new Promise<void>((r) => setImmediate(r))
+		await new Promise<void>((r) => setImmediate(r))
+
+		eventSocket().emit('message', makeSync({ flags: FLAG_ASSIST, sequence: 1 }), rinfo)
+		generalSocket().emit('message', makeFollowUp({ sequence: 1, tsSeconds: MASTER_SECONDS }), rinfo)
+		await new Promise<void>((r) => setImmediate(r))
+		const seq = eventSocket().send.mock.calls[0][0].readUInt16BE(30)
+
+		const response = respondTo(client, seq, { tsSeconds: MASTER_SECONDS })
+		generalSocket().emit('message', response, rinfo)
+		const once = client.ptp_time_n
+		generalSocket().emit('message', response, rinfo) // the network duplicated it
+		expect(client.ptp_time_n).toBe(once)
+		client.destroy()
+	})
+})
+
+// ===========================================================================
 // Sharing a NIC with other connections
 // ===========================================================================
 /**

@@ -1274,6 +1274,61 @@ describe('FIX: destroy with a pending Delay_Req', () => {
 })
 
 // ===========================================================================
+// Late Delay_Resp
+// ===========================================================================
+/**
+ * ts1 is the local receive time of the Sync and is not read until the Delay_Resp completes
+ * the exchange, so a Sync arriving in that window must not overwrite it. See the PTPv1 suite
+ * for the same case: the failure is a confident lock reporting a time out by half the gap
+ * between the two Syncs.
+ */
+describe('PTPv2 Delay_Resp arriving after the next Sync', () => {
+	const GAP_MS = 200
+
+	beforeEach(() => {
+		vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'setInterval', 'clearInterval', 'Date', 'hrtime'] })
+	})
+	afterEach(() => {
+		vi.useRealTimers()
+	})
+
+	it('still measures against the Sync the exchange belongs to', async () => {
+		const client = new PTPv2Client('0.0.0.0', 0, 125, 'e2e')
+		await vi.advanceTimersByTimeAsync(0)
+		await vi.advanceTimersByTimeAsync(0)
+
+		eventSocket().emit('message', makeSyncBuffer({ flags: 0x0200, sequence: 1 }), rinfo)
+		generalSocket().emit('message', makeFollowUpBuffer({ sequence: 1, tsSecondsLow: 1_700_000_000 }), rinfo)
+		await vi.advanceTimersByTimeAsync(0)
+
+		vi.advanceTimersByTime(GAP_MS)
+		eventSocket().emit('message', makeSyncBuffer({ flags: 0x0200, sequence: 2 }), rinfo)
+		generalSocket().emit('message', makeDelayRespBuffer(client, { sequence: 1, tsSecondsLow: 1_700_000_000 }), rinfo)
+
+		const expected = BigInt(1_700_000_000) * 1_000_000_000n + BigInt(GAP_MS) * 1_000_000n
+		expect(client.ptp_time_n).toBe(expected)
+		client.destroy()
+	})
+
+	it('folds a duplicated Delay_Resp in once, not twice', async () => {
+		const client = new PTPv2Client('0.0.0.0', 0, 125, 'e2e')
+		await vi.advanceTimersByTimeAsync(0)
+		await vi.advanceTimersByTimeAsync(0)
+		eventSocket().emit('message', makeSyncBuffer({ flags: 0x0000, tsSecondsLow: 1_700_000_000 }), rinfo)
+		await vi.advanceTimersByTimeAsync(0)
+
+		const response = makeDelayRespBuffer(client, { sequence: 1, tsSecondsLow: 1_700_000_000 })
+		generalSocket().emit('message', response, rinfo)
+		const once = client.ptp_time_n
+		const delayOnce = client.mean_path_delay
+		generalSocket().emit('message', response, rinfo)
+		expect(client.ptp_time_n).toBe(once)
+		expect(client.mean_path_delay).toBe(delayOnce)
+		client.destroy()
+	})
+})
+
+// ===========================================================================
 // Sharing a NIC with other connections
 // ===========================================================================
 describe('PTPv2 sharing an interface', () => {

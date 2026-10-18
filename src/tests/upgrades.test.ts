@@ -26,6 +26,7 @@ const upToDateConfig = (): ModuleConfig => ({
 	customSubdomainGroup: '224.0.1.130',
 	interval: 10000,
 	delayMechanism: 'p2p',
+	unicastDelayReq: false,
 })
 
 const context = (config: ModuleConfig | null): CompanionUpgradeContext<ModuleConfig> =>

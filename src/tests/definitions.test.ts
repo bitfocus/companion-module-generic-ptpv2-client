@@ -19,6 +19,7 @@ const config = (ptpVersion: 'v2' | 'v1'): ModuleConfig => ({
 	customSubdomainGroup: '224.0.1.130',
 	interval: 10000,
 	delayMechanism: 'auto',
+	unicastDelayReq: false,
 })
 
 const variablesFor = (ptpVersion: 'v2' | 'v1'): (keyof VariablesSchema)[] => {
@@ -46,12 +47,20 @@ describe('variable definitions by protocol', () => {
 		'ptpTimeNS',
 		'ptpTime',
 		'lastSync',
+		// Both protocols can measure these: they need Sync messages and nothing else
+		'syncRate',
+		'syncLossPercent',
+		'syncLost',
 		'ptpMaster',
 		'ptpMasterAddress',
 		// Both protocols identify the sending port by an EUI-48, so both can name its maker
 		'ptpMasterMac',
 		'ptpMasterOui',
 		'ptpMasterVendor',
+		// A domain can split under either protocol, and both detect it from Sync alone
+		'mastersFound',
+		'mastersLive',
+		'masterContention',
 		'ptpVersion',
 	]
 
@@ -77,6 +86,8 @@ describe('variable definitions by protocol', () => {
 		'grandmasterTimeSource',
 		'stepsRemoved',
 		'announceInterval',
+		'announceRate',
+		'domainsFound',
 		'pathTrace',
 		'pathTraceLoop',
 		'utcOffset',
@@ -138,8 +149,15 @@ describe('feedback definitions by protocol', () => {
 		expect(feedbacksFor('v1')).not.toContain(id)
 	})
 
-	it('leaves PTPv1 with exactly one feedback', () => {
-		expect(feedbacksFor('v1')).toEqual([FeedbackIDs.IsSynced])
+	it('leaves PTPv1 with only the feedbacks both protocols can raise', () => {
+		// Sync state and master contention are both derived from Sync messages alone, which
+		// is all IEEE 1588-2002 gives us — everything else needs Announce
+		expect(feedbacksFor('v1')).toEqual([FeedbackIDs.IsSynced, FeedbackIDs.MasterContention])
+	})
+
+	it('offers master contention in both protocols, since a domain can split in either', () => {
+		expect(feedbacksFor('v1')).toContain(FeedbackIDs.MasterContention)
+		expect(feedbacksFor('v2')).toContain(FeedbackIDs.MasterContention)
 	})
 
 	it('defaults to the PTPv2 set when no protocol has been chosen yet', () => {

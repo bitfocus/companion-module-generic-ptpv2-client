@@ -445,6 +445,444 @@ describe('PTPv1 subdomain handling', () => {
 })
 
 // ===========================================================================
+// Late Delay_Resp
+// ===========================================================================
+/**
+ * ts1 is the local receive time of the Sync, and it is not read until the Delay_Resp
+ * completes the exchange. Any Sync arriving in that window must not overwrite it, or this
+ * master's t1 ends up paired with the receive time of a later Sync and the offset comes out
+ * wrong by half the gap between them — which on a clock sending four Sync a second is 125ms,
+ * reported as a confident lock.
+ */
+describe('PTPv1 Delay_Resp arriving after the next Sync', () => {
+	const MASTER_SECONDS = 1_700_000_000
+	const MASTER_NS = BigInt(MASTER_SECONDS) * 1_000_000_000n
+	const GAP_MS = 200
+
+	beforeEach(() => {
+		vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'setInterval', 'clearInterval', 'Date', 'hrtime'] })
+	})
+	afterEach(() => {
+		vi.useRealTimers()
+	})
+
+	it('still measures against the Sync the exchange belongs to', async () => {
+		const client = new PTPv1Client('0.0.0.0', '_DFLT', 125)
+		await new Promise<void>((r) => setImmediate(r))
+		await new Promise<void>((r) => setImmediate(r))
+
+		// Two-step exchange: the Follow_Up carries t1 and triggers the Delay_Req
+		eventSocket().emit('message', makeSync({ flags: FLAG_ASSIST, sequence: 1 }), rinfo)
+		generalSocket().emit('message', makeFollowUp({ sequence: 1, tsSeconds: MASTER_SECONDS }), rinfo)
+		await new Promise<void>((r) => setImmediate(r))
+		const seq = eventSocket().send.mock.calls[0][0].readUInt16BE(30)
+
+		// The master keeps sending Sync while our Delay_Resp is still in flight
+		vi.advanceTimersByTime(GAP_MS)
+		eventSocket().emit('message', makeSync({ flags: FLAG_ASSIST, sequence: 2 }), rinfo)
+		generalSocket().emit('message', respondTo(client, seq, { tsSeconds: MASTER_SECONDS }), rinfo)
+
+		// The local clock has moved GAP_MS since the Sync this exchange measured, so PTP time
+		// is that far past the master's timestamp. Taking ts1 from Sync 2 would halve it.
+		expect(client.ptp_time_n).toBe(MASTER_NS + BigInt(GAP_MS) * 1_000_000n)
+		client.destroy()
+	})
+
+	it('folds a duplicated Delay_Resp in once, not twice', async () => {
+		// A response matched only on sequence is accepted as often as it arrives, and the
+		// correction is computed from fixed values — so applying it twice doubles it. On the
+		// first exchange that correction is the entire gap to the PTP epoch.
+		const client = new PTPv1Client('0.0.0.0', '_DFLT', 125)
+		await new Promise<void>((r) => setImmediate(r))
+		await new Promise<void>((r) => setImmediate(r))
+
+		eventSocket().emit('message', makeSync({ flags: FLAG_ASSIST, sequence: 1 }), rinfo)
+		generalSocket().emit('message', makeFollowUp({ sequence: 1, tsSeconds: MASTER_SECONDS }), rinfo)
+		await new Promise<void>((r) => setImmediate(r))
+		const seq = eventSocket().send.mock.calls[0][0].readUInt16BE(30)
+
+		const response = respondTo(client, seq, { tsSeconds: MASTER_SECONDS })
+		generalSocket().emit('message', response, rinfo)
+		const once = client.ptp_time_n
+		generalSocket().emit('message', response, rinfo) // the network duplicated it
+		expect(client.ptp_time_n).toBe(once)
+		client.destroy()
+	})
+})
+
+// ===========================================================================
+// Sharing a NIC with other connections
+// ===========================================================================
+/**
+ * Several Companion connections can watch one interface — PTPv1 and PTPv2 together, or two
+ * subdomains. The sockets bind with SO_REUSEADDR and multicast is delivered to every one of
+ * them, so each connection sees all the traffic and has to reject what is not its own.
+ */
+describe('PTPv1 sharing an interface', () => {
+	/** A PTPv2 Sync as it appears on 224.0.1.129, which PTPv1 joins as well */
+	const v2Packet = (domain: number): Buffer => {
+		const buf = Buffer.alloc(44)
+		buf.writeUInt8(0x00, 0) // messageType Sync
+		buf.writeUInt8(0x02, 1) // versionPTP 2
+		buf.writeUInt16BE(44, 2)
+		buf.writeUInt8(domain, 4)
+		return buf
+	}
+
+	it.each([0, 95, 127, 200])('ignores a PTPv2 Sync on domain %i', async (domain) => {
+		const client = await makeClient()
+		eventSocket().emit('message', v2Packet(domain), rinfo)
+		expect(client.ptp_master[0]).toBe('')
+		expect(client.is_synced).toBe(false)
+		client.destroy()
+	})
+
+	it.each([95, 127, 200])('keeps a PTPv2 domain %i out of the discovered subdomains', async (domain) => {
+		// Bytes 4-19 of a PTPv2 header are the domain, flags and correction field. Read as a
+		// PTPv1 subdomain name they decode to a one-character string, which would appear in
+		// the list a Dante Domain Manager subdomain is meant to be discovered from.
+		const client = await makeClient()
+		eventSocket().emit('message', v2Packet(domain), rinfo)
+		generalSocket().emit('message', v2Packet(domain), rinfo)
+		expect([...client.subdomains]).toEqual([])
+		client.destroy()
+	})
+
+	it('gives each client on the same NIC a distinct port number', async () => {
+		// The uuid comes from the interface, so two connections watching one NIC share it.
+		// Only the port number can tell their Delay_Req apart, and without that each would
+		// accept the other's Delay_Resp and report a time built from mismatched timestamps.
+		const clients = await Promise.all([makeClient(), makeClient(), makeClient(), makeClient()])
+		const ports = clients.map((c) => c.source_port_id)
+		expect(new Set(ports).size).toBe(ports.length)
+		for (const port of ports) expect(port).toBeGreaterThanOrEqual(1)
+		for (const port of ports) expect(port).toBeLessThanOrEqual(0xffff)
+		clients.forEach((c) => c.destroy())
+	})
+
+	it('stamps that port number on the Delay_Req it sends', async () => {
+		const client = await makeClient()
+		await syncAndRequest()
+		expect(eventSocket().send.mock.calls[0][0].readUInt16BE(28)).toBe(client.source_port_id)
+		client.destroy()
+	})
+})
+
+// ===========================================================================
+// Delay request delivery and response
+// ===========================================================================
+/**
+ * A master that never answers Delay_Req leaves the clock permanently unlocked with nothing
+ * else to show for it — no error, no timeout, just a connection that never syncs. It is the
+ * one hard failure the module could previously only be inferred from.
+ */
+describe('PTPv1 delay requests', () => {
+	const withTimers = () =>
+		vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'setInterval', 'clearInterval', 'Date', 'hrtime'] })
+
+	/** One Sync, its Delay_Req flushed, and enough time for the next to be due */
+	const requestCycle = async (sequence: number) => {
+		eventSocket().emit('message', makeSync({ sequence }), rinfo)
+		await new Promise<void>((r) => setImmediate(r))
+		vi.advanceTimersByTime(200)
+	}
+
+	it('starts out assuming the master answers', async () => {
+		const client = await makeClient()
+		expect(client.delay_responding).toBe(true)
+		client.destroy()
+	})
+
+	it('reports the master as unresponsive after three unanswered requests', async () => {
+		withTimers()
+		const client = new PTPv1Client('0.0.0.0', '_DFLT', 125)
+		await vi.advanceTimersByTimeAsync(0)
+		await vi.advanceTimersByTimeAsync(0)
+		const changed = vi.fn()
+		client.on('delay_response_changed', changed)
+
+		await requestCycle(1)
+		await requestCycle(2)
+		expect(client.delay_responding).toBe(true) // two is not yet a pattern
+		await requestCycle(3)
+
+		expect(client.delay_responding).toBe(false)
+		expect(changed).toHaveBeenCalledTimes(1)
+		expect(changed).toHaveBeenCalledWith(false, 3)
+		vi.useRealTimers()
+		client.destroy()
+	})
+
+	it('says so once, not on every further request', async () => {
+		withTimers()
+		const client = new PTPv1Client('0.0.0.0', '_DFLT', 125)
+		await vi.advanceTimersByTimeAsync(0)
+		await vi.advanceTimersByTimeAsync(0)
+		const changed = vi.fn()
+		client.on('delay_response_changed', changed)
+		for (let i = 1; i <= 8; i++) await requestCycle(i)
+		expect(changed).toHaveBeenCalledTimes(1)
+		vi.useRealTimers()
+		client.destroy()
+	})
+
+	it('recovers when the master starts answering again', async () => {
+		withTimers()
+		const client = new PTPv1Client('0.0.0.0', '_DFLT', 125)
+		await vi.advanceTimersByTimeAsync(0)
+		await vi.advanceTimersByTimeAsync(0)
+		const changed = vi.fn()
+		client.on('delay_response_changed', changed)
+		for (let i = 1; i <= 3; i++) await requestCycle(i)
+		expect(client.delay_responding).toBe(false)
+
+		const calls = eventSocket().send.mock.calls
+		const seq = calls[calls.length - 1][0].readUInt16BE(30)
+		generalSocket().emit('message', respondTo(client, seq), rinfo)
+
+		expect(client.delay_responding).toBe(true)
+		expect(changed).toHaveBeenLastCalledWith(true, 0)
+		vi.useRealTimers()
+		client.destroy()
+	})
+
+	it('sends to the multicast group by default', async () => {
+		const client = await makeClient()
+		await syncAndRequest()
+		expect(eventSocket().send).toHaveBeenCalledWith(expect.anything(), 319, '224.0.1.129', expect.anything())
+		expect(client.delay_req_destination).toBe('224.0.1.129')
+		client.destroy()
+	})
+
+	it('sends straight to the master when unicast is enabled', async () => {
+		// Keeps this module's Delay_Req off every other device, and works where the group is
+		// being filtered — which is how a filtered path is told apart from a silent master
+		const client = new PTPv1Client('0.0.0.0', '_DFLT', 125, undefined, true)
+		await new Promise<void>((r) => setImmediate(r))
+		await new Promise<void>((r) => setImmediate(r))
+		await syncAndRequest()
+		expect(eventSocket().send).toHaveBeenCalledWith(expect.anything(), 319, rinfo.address, expect.anything())
+		expect(client.delay_req_destination).toBe(rinfo.address)
+		client.destroy()
+	})
+
+	it('falls back to the group until a master has been heard from', async () => {
+		// There is no address to unicast to before the first Sync
+		const client = new PTPv1Client('0.0.0.0', '_DFLT', 125, undefined, true)
+		await new Promise<void>((r) => setImmediate(r))
+		await new Promise<void>((r) => setImmediate(r))
+		expect(client.delay_req_destination).toBe('224.0.1.129')
+		client.destroy()
+	})
+})
+
+// ===========================================================================
+// Observed rate and loss
+// ===========================================================================
+/**
+ * What the master advertises and what actually arrives are different things, and the gap
+ * between them is the measurement that matters when multicast is being dropped. Nothing
+ * else the client reports would reveal it: sync stays up, the offset stays plausible, and
+ * the only trace is the hole left in the sequence numbering.
+ */
+describe('PTPv1 sync rate and loss', () => {
+	it('reports no loss for an unbroken run of Syncs', async () => {
+		const client = await makeClient()
+		for (let i = 1; i <= 10; i++) eventSocket().emit('message', makeSync({ sequence: i }), rinfo)
+		expect(client.sync_lost_total).toBe(0)
+		expect(client.sync_loss_percent).toBe(0)
+		client.destroy()
+	})
+
+	it('counts the Syncs a gap in the sequence implies', async () => {
+		const client = await makeClient()
+		eventSocket().emit('message', makeSync({ sequence: 1 }), rinfo)
+		eventSocket().emit('message', makeSync({ sequence: 5 }), rinfo) // 2, 3 and 4 never arrived
+		expect(client.sync_lost_total).toBe(3)
+		client.destroy()
+	})
+
+	it('reports loss as a percentage of what the master sent', async () => {
+		const client = await makeClient()
+		// 8 sent, 4 arrive: every other one is dropped
+		for (const seq of [1, 3, 5, 7]) eventSocket().emit('message', makeSync({ sequence: seq }), rinfo)
+		expect(client.sync_lost_total).toBe(3)
+		expect(client.sync_loss_percent).toBeCloseTo(42.86, 1)
+		client.destroy()
+	})
+
+	it('does not count a repeated Sync as loss', async () => {
+		const client = await makeClient()
+		eventSocket().emit('message', makeSync({ sequence: 4 }), rinfo)
+		eventSocket().emit('message', makeSync({ sequence: 4 }), rinfo)
+		expect(client.sync_lost_total).toBe(0)
+		client.destroy()
+	})
+
+	it('does not count a master restart as loss', async () => {
+		const client = await makeClient()
+		eventSocket().emit('message', makeSync({ sequence: 40000 }), rinfo)
+		eventSocket().emit('message', makeSync({ sequence: 1 }), rinfo) // renumbered from zero
+		expect(client.sync_lost_total).toBe(0)
+		client.destroy()
+	})
+
+	it("ignores a rival master's sequence numbers entirely", async () => {
+		// Sequence numbers are per port. Counting a rival's against ours would invent loss
+		// out of nothing on a split domain — the exact case this figure is meant to diagnose.
+		const client = await makeClient()
+		eventSocket().emit('message', makeSync({ uuid: 'aaaaaaaaaaaa', sequence: 1 }), rinfo)
+		eventSocket().emit('message', makeSync({ uuid: 'bbbbbbbbbbbb', sequence: 40000 }), rinfo)
+		eventSocket().emit('message', makeSync({ uuid: 'aaaaaaaaaaaa', sequence: 2 }), rinfo)
+		expect(client.sync_lost_total).toBe(0)
+		client.destroy()
+	})
+
+	it('starts the count again when the master is replaced', async () => {
+		vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'setInterval', 'clearInterval', 'Date', 'hrtime'] })
+		const client = new PTPv1Client('0.0.0.0', '_DFLT', 125)
+		await vi.advanceTimersByTimeAsync(0)
+		await vi.advanceTimersByTimeAsync(0)
+		eventSocket().emit('message', makeSync({ uuid: 'aaaaaaaaaaaa', sequence: 1 }), rinfo)
+		eventSocket().emit('message', makeSync({ uuid: 'aaaaaaaaaaaa', sequence: 9 }), rinfo)
+		expect(client.sync_lost_total).toBe(7)
+
+		await vi.advanceTimersByTimeAsync(client.sync_receipt_timeout + 1000)
+		eventSocket().emit('message', makeSync({ uuid: 'bbbbbbbbbbbb', sequence: 500 }), rinfo)
+		expect(client.sync_lost_total).toBe(0)
+		vi.useRealTimers()
+		client.destroy()
+	})
+
+	it('measures the rate the Syncs actually arrive at', async () => {
+		vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'setInterval', 'clearInterval', 'Date', 'hrtime'] })
+		const client = new PTPv1Client('0.0.0.0', '_DFLT', 125)
+		await vi.advanceTimersByTimeAsync(0)
+		await vi.advanceTimersByTimeAsync(0)
+		for (let i = 1; i <= 9; i++) {
+			eventSocket().emit('message', makeSync({ sequence: i }), rinfo)
+			await vi.advanceTimersByTimeAsync(125) // 8 per second
+		}
+		expect(client.sync_rate).toBeCloseTo(8, 1)
+		vi.useRealTimers()
+		client.destroy()
+	})
+})
+
+// ===========================================================================
+// Split domain
+// ===========================================================================
+/**
+ * Two clocks sending Sync on one subdomain means the PTP domain has split: each side has
+ * elected its own grandmaster and the two are free-running relative to each other. It is
+ * what multicast being dropped between two sites looks like from inside one of them.
+ *
+ * The client must do two things at once — keep following exactly one of them so the
+ * measurement stays coherent, and say plainly that the other is there.
+ */
+describe('PTPv1 split domain', () => {
+	const A = 'aaaaaaaaaaaa'
+	const B = 'bbbbbbbbbbbb'
+	const rinfoB = { address: '10.0.0.2', family: 'IPv4', port: 319, size: 124 }
+
+	it('locks to the first master and ignores the rival on every subsequent Sync', async () => {
+		const client = await makeClient()
+		const changed = vi.fn()
+		client.on('ptp_master_changed', changed)
+		for (let i = 0; i < 4; i++) {
+			eventSocket().emit('message', makeSync({ uuid: A, sequence: 10 + i }), rinfo)
+			eventSocket().emit('message', makeSync({ uuid: B, sequence: 900 + i }), rinfoB)
+		}
+		expect(changed).toHaveBeenCalledTimes(1)
+		expect(client.ptp_master[0]).toBe('aa-aa-aa-aa-aa-aa:1')
+		client.destroy()
+	})
+
+	it('reports both clocks and raises contention', async () => {
+		const client = await makeClient()
+		const contention = vi.fn()
+		client.on('master_contention_changed', contention)
+		eventSocket().emit('message', makeSync({ uuid: A }), rinfo)
+		expect(client.master_contention).toBe(false)
+		eventSocket().emit('message', makeSync({ uuid: B }), rinfoB)
+		expect(client.master_contention).toBe(true)
+		expect(client.masters_found).toEqual(['aa-aa-aa-aa-aa-aa:1', 'bb-bb-bb-bb-bb-bb:1'])
+		expect(client.masters_live).toHaveLength(2)
+		expect(contention).toHaveBeenCalledTimes(1)
+		expect(contention).toHaveBeenCalledWith(true, ['aa-aa-aa-aa-aa-aa:1', 'bb-bb-bb-bb-bb-bb:1'])
+		client.destroy()
+	})
+
+	it('raises contention once, not on every packet from the other side', async () => {
+		const client = await makeClient()
+		const contention = vi.fn()
+		client.on('master_contention_changed', contention)
+		for (let i = 0; i < 5; i++) {
+			eventSocket().emit('message', makeSync({ uuid: A, sequence: 10 + i }), rinfo)
+			eventSocket().emit('message', makeSync({ uuid: B, sequence: 900 + i }), rinfoB)
+		}
+		expect(contention).toHaveBeenCalledTimes(1)
+		client.destroy()
+	})
+
+	it("does not let a rival's Follow_Up supply t1 for our master's Sync", async () => {
+		// sequenceId is only unique per port, so two grandmasters collide sooner or later.
+		// Taking the rival's Follow_Up would pair its transmit time with our receive time.
+		const client = await makeClient()
+		eventSocket().emit('message', makeSync({ uuid: A, flags: FLAG_ASSIST, sequence: 7 }), rinfo)
+		generalSocket().emit('message', makeFollowUp({ uuid: B, sequence: 7, associatedSequence: 7 }), rinfoB)
+		await new Promise<void>((r) => setImmediate(r))
+		expect(eventSocket().send).not.toHaveBeenCalled()
+		client.destroy()
+	})
+
+	it("does not let a rival's Sync clobber the sequence our Follow_Up is matched on", async () => {
+		const client = await makeClient()
+		eventSocket().emit('message', makeSync({ uuid: A, flags: FLAG_ASSIST, sequence: 7 }), rinfo)
+		eventSocket().emit('message', makeSync({ uuid: B, flags: FLAG_ASSIST, sequence: 99 }), rinfoB)
+		generalSocket().emit('message', makeFollowUp({ uuid: A, sequence: 7, associatedSequence: 7 }), rinfo)
+		await new Promise<void>((r) => setImmediate(r))
+		// Our master's own Follow_Up still completes the exchange
+		expect(eventSocket().send).toHaveBeenCalledTimes(1)
+		client.destroy()
+	})
+
+	it("ignores a rival's Delay_Resp, which is addressed to us but not from our master", async () => {
+		// Delay_Req is multicast, so every master on the subdomain may answer it and every
+		// answer carries our uuid, port and sequence
+		const client = await makeClient()
+		await syncAndRequest({ uuid: A })
+		const seq = eventSocket().send.mock.calls[0][0].readUInt16BE(30)
+		generalSocket().emit('message', respondTo(client, seq, { uuid: B, tsSeconds: 1_600_000_000 }), rinfoB)
+		expect(client.is_synced).toBe(false)
+		expect(client.last_sync).toBe(0)
+		client.destroy()
+	})
+
+	it('hands over once the master it was following goes quiet', async () => {
+		vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'setInterval', 'clearInterval', 'Date', 'hrtime'] })
+		const client = new PTPv1Client('0.0.0.0', '_DFLT', 125)
+		await vi.advanceTimersByTimeAsync(0)
+		await vi.advanceTimersByTimeAsync(0)
+		const changed = vi.fn()
+		client.on('ptp_master_changed', changed)
+		eventSocket().emit('message', makeSync({ uuid: A }), rinfo)
+		expect(client.ptp_master[0]).toBe('aa-aa-aa-aa-aa-aa:1')
+
+		// A stops. Only once its receipt timeout has passed may anyone else take over.
+		await vi.advanceTimersByTimeAsync(client.sync_receipt_timeout + 1000)
+		eventSocket().emit('message', makeSync({ uuid: B }), rinfoB)
+		expect(client.ptp_master[0]).toBe('bb-bb-bb-bb-bb-bb:1')
+		expect(changed).toHaveBeenCalledTimes(2)
+		// A failover is not contention: only one clock is transmitting
+		expect(client.master_contention).toBe(false)
+		expect(client.masters_live).toEqual(['bb-bb-bb-bb-bb-bb:1'])
+		vi.useRealTimers()
+		client.destroy()
+	})
+})
+
+// ===========================================================================
 // Master identity
 // ===========================================================================
 describe('PTPv1 master identity', () => {
@@ -469,13 +907,16 @@ describe('PTPv1 master identity', () => {
 	it.each([
 		['a different uuid', { uuid: '112233445566' }],
 		['a different port on the same clock', { portId: 2 }],
-	])('announces a new master for %s', async (_label, opts) => {
+	])('keeps the master it has when %s starts sending Sync as well', async (_label, opts) => {
+		// A second clock sending Sync is a split domain, not a handover. Following whichever
+		// spoke last would mix two grandmasters' timestamps and never lock.
 		const client = await makeClient()
 		const changed = vi.fn()
 		client.on('ptp_master_changed', changed)
 		eventSocket().emit('message', makeSync(), rinfo)
 		eventSocket().emit('message', makeSync(opts), rinfo)
-		expect(changed).toHaveBeenCalledTimes(2)
+		expect(changed).toHaveBeenCalledTimes(1)
+		expect(client.ptp_master[0]).toBe('aa-bb-cc-dd-ee-ff:1')
 		client.destroy()
 	})
 })
@@ -614,6 +1055,17 @@ describe('PTPv1 sync state', () => {
 		generalSocket().emit('message', respondTo(client, seq), rinfo)
 		expect(syncChanged).toHaveBeenCalledTimes(1)
 		client.destroy()
+	})
+
+	it('reports no drop on destroy when it never locked', async () => {
+		// Every config change destroys the client, so an unsynced connection being torn down
+		// would otherwise log an Unlocked warning for a lock it never had
+		const client = await makeClient()
+		const syncChanged = vi.fn()
+		client.on('sync_changed', syncChanged)
+		client.destroy()
+		expect(syncChanged).not.toHaveBeenCalled()
+		expect(client.is_synced).toBe(false)
 	})
 
 	it('drops sync on destroy so a stale lock is not left on display', async () => {
@@ -814,10 +1266,10 @@ describe('PTPv1 master identity', () => {
 		client.destroy()
 	})
 
-	it('follows the master when it changes', async () => {
+	it('reports the identity of the master it is following, not of a rival', async () => {
 		const client = await makeClient()
-		eventSocket().emit('message', makeSync({ uuid: 'aabbccddeeff' }), rinfo)
 		eventSocket().emit('message', makeSync({ uuid: '186696110b52' }), rinfo)
+		eventSocket().emit('message', makeSync({ uuid: 'aabbccddeeff' }), rinfo)
 		expect(client.ptp_master_mac).toBe('18:66:96:11:0b:52')
 		expect(client.ptp_master_vendor).toBe('Turtle AV')
 		client.destroy()
@@ -951,7 +1403,12 @@ describe('PTPv1 Delay_Resp ownership', () => {
 	it('ignores a Delay_Resp for another port of the same clock', async () => {
 		const client = await makeClient()
 		const seq = await completeExchange()
-		generalSocket().emit('message', makeDelayResp({ uuid: client.source_uuid, portId: 99, sequence: seq }), rinfo)
+		const otherPort = (client.source_port_id % 0xffff) + 1 // never this client's own
+		generalSocket().emit(
+			'message',
+			makeDelayResp({ uuid: client.source_uuid, portId: otherPort, sequence: seq }),
+			rinfo,
+		)
 		expect(client.is_synced).toBe(false)
 		client.destroy()
 	})
@@ -1046,6 +1503,27 @@ describe('PTPv1 sync loss', () => {
 		expect(syncChanged).not.toHaveBeenCalled()
 		await vi.advanceTimersByTimeAsync(200)
 		expect(syncChanged).toHaveBeenCalledWith(false)
+		expect(client.is_synced).toBe(false)
+		client.destroy()
+	})
+
+	it('times out from the Sync, not from the Delay_Resp that answered it', async () => {
+		// The receipt timeout exists to measure the master's Sync flow. Re-arming it when our
+		// own exchange completes would extend the lock by the round trip, and would mean a
+		// master that had stopped sending Sync looked present for longer than it was.
+		const client = new PTPv1Client('0.0.0.0', '_DFLT', 125)
+		await vi.advanceTimersByTimeAsync(0)
+		eventSocket().emit('message', syncWithInterval(0), rinfo) // 1s interval, so 3s timeout
+		await vi.advanceTimersByTimeAsync(0)
+		const seq = eventSocket().send.mock.calls[0][0].readUInt16BE(30)
+
+		// The response comes back well after the Sync it belongs to
+		await vi.advanceTimersByTimeAsync(500)
+		generalSocket().emit('message', respondTo(client, seq), rinfo)
+		expect(client.is_synced).toBe(true)
+
+		// 3s after the Sync, which is 2.5s after the Delay_Resp
+		await vi.advanceTimersByTimeAsync(2_600)
 		expect(client.is_synced).toBe(false)
 		client.destroy()
 	})

@@ -24,12 +24,19 @@ export type ModuleConfig = {
 	interval: number
 	/** PTPv2 only */
 	delayMechanism: DelayMechanism
+	/** Send Delay_Req straight to the master rather than to the multicast group */
+	unicastDelayReq: boolean
 }
 
 /** Referenced by the isVisibleExpression of every version-specific field below */
 const isV2 = `$(options:ptpVersion) == 'v2'`
 const isV1 = `$(options:ptpVersion) == 'v1'`
 const isV1Custom = `${isV1} && $(options:subdomain) == 'custom'`
+/**
+ * Unicast Delay_Req applies wherever a Delay_Req is sent at all: always in PTPv1, and in
+ * PTPv2 unless the mechanism is one that never sends one.
+ */
+const sendsDelayReq = `${isV1} || (${isV2} && $(options:delayMechanism) != 'p2p' && $(options:delayMechanism) != 'passive')`
 /** A domain IEEE 1588-2008 reserved, so selecting one asserts the network is 1588-2019 */
 const isV2Domain2019 = `${isV2} && $(options:domain) > 127`
 
@@ -103,6 +110,27 @@ export function GetConfigFields(): SomeCompanionConfigField[] {
 			width: 12,
 		},
 		{
+			type: 'checkbox',
+			id: 'unicastDelayReq',
+			label: 'Unicast Delay Requests',
+			width: 12,
+			default: false,
+			isVisibleExpression: sendsDelayReq,
+		},
+		{
+			type: 'static-text',
+			id: 'unicastDelayReqHelp',
+			label: '',
+			isVisibleExpression: sendsDelayReq,
+			value:
+				`Sends this module's Delay_Req straight to the master instead of to the multicast group, so it is not delivered to every other device on the network. ` +
+				`Dante offers the same setting per device, and Audinate recommends it on larger networks for the same reason. ` +
+				`The master still answers, and its reply is unicast back. ` +
+				`Multicast is used until the first Sync arrives, because until then there is no master address to send to. ` +
+				`If the multicast group is being filtered somewhere, this is also the way to tell a master that is ignoring us from a path that is dropping the request.`,
+			width: 12,
+		},
+		{
 			type: 'dropdown',
 			id: 'subdomain',
 			label: 'Subdomain',
@@ -169,6 +197,8 @@ export function GetConfigFields(): SomeCompanionConfigField[] {
 			width: 12,
 			default: 'auto',
 			isVisibleExpression: isV2,
+			// Referenced by the isVisibleExpression of the unicast Delay_Req fields
+			disableAutoExpression: true,
 			choices: [
 				{ id: 'auto', label: 'Auto — detect peer delay, otherwise end to end' },
 				{ id: 'e2e', label: 'End to End (E2E) — SMPTE ST 2059-2, AES67' },

@@ -35,6 +35,7 @@ jobs:
       - name: Build and check types
         run: |
           yarn build
+          yarn test:types
         env:
           CI: true
       - name: Run lint

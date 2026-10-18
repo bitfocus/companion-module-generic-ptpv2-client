@@ -637,7 +637,6 @@ export class PTPv1Client extends EventEmitter<PTPv1ClientEvents> {
 				this.noteDelayRespReceived()
 				this.lastSync = Date.now()
 				this.emit('ptp_time_synced', this.ptp_time, this.lastSync)
-				this.startSyncTimeout()
 				this.sync_change(true)
 			}
 		})
@@ -667,8 +666,8 @@ export class PTPv1Client extends EventEmitter<PTPv1ClientEvents> {
 		this.ptpClientEvent.close()
 		this.ptpClientGeneral.removeAllListeners()
 		this.ptpClientGeneral.close()
-		this.sync = false
-		this.emit('sync_changed', this.sync)
+		// Route through sync_change: a connection that never locked has no drop to report
+		this.sync_change(false)
 	}
 
 	/** Whether the client has achieved and maintained a sync lock. */
@@ -952,6 +951,7 @@ export class PTPv1Client extends EventEmitter<PTPv1ClientEvents> {
 			this.syncTimeout = undefined
 			this.sync_change(false)
 		}, this.sync_receipt_timeout)
+		this.syncTimeout.unref?.()
 	}
 
 	/**

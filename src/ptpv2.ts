@@ -1148,6 +1148,7 @@ export class PTPv2Client extends EventEmitter<PTPv2ClientEvents> {
 			if (this.sync) this.emit('master_lost', `No Sync for ${this.sync_receipt_timeout}ms`)
 			this.sync_change(false)
 		}, this.sync_receipt_timeout)
+		this.syncTimeout.unref?.()
 	}
 
 	/**
@@ -1166,6 +1167,7 @@ export class PTPv2Client extends EventEmitter<PTPv2ClientEvents> {
 			this.emit('master_lost', `No Announce for ${this.announce_receipt_timeout}ms`)
 			this.sync_change(false)
 		}, this.announce_receipt_timeout)
+		this.announceTimeout.unref?.()
 	}
 
 	/**

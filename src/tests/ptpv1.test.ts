@@ -1057,6 +1057,17 @@ describe('PTPv1 sync state', () => {
 		client.destroy()
 	})
 
+	it('reports no drop on destroy when it never locked', async () => {
+		// Every config change destroys the client, so an unsynced connection being torn down
+		// would otherwise log an Unlocked warning for a lock it never had
+		const client = await makeClient()
+		const syncChanged = vi.fn()
+		client.on('sync_changed', syncChanged)
+		client.destroy()
+		expect(syncChanged).not.toHaveBeenCalled()
+		expect(client.is_synced).toBe(false)
+	})
+
 	it('drops sync on destroy so a stale lock is not left on display', async () => {
 		const client = await makeClient()
 		await syncAndRequest()
@@ -1492,6 +1503,27 @@ describe('PTPv1 sync loss', () => {
 		expect(syncChanged).not.toHaveBeenCalled()
 		await vi.advanceTimersByTimeAsync(200)
 		expect(syncChanged).toHaveBeenCalledWith(false)
+		expect(client.is_synced).toBe(false)
+		client.destroy()
+	})
+
+	it('times out from the Sync, not from the Delay_Resp that answered it', async () => {
+		// The receipt timeout exists to measure the master's Sync flow. Re-arming it when our
+		// own exchange completes would extend the lock by the round trip, and would mean a
+		// master that had stopped sending Sync looked present for longer than it was.
+		const client = new PTPv1Client('0.0.0.0', '_DFLT', 125)
+		await vi.advanceTimersByTimeAsync(0)
+		eventSocket().emit('message', syncWithInterval(0), rinfo) // 1s interval, so 3s timeout
+		await vi.advanceTimersByTimeAsync(0)
+		const seq = eventSocket().send.mock.calls[0][0].readUInt16BE(30)
+
+		// The response comes back well after the Sync it belongs to
+		await vi.advanceTimersByTimeAsync(500)
+		generalSocket().emit('message', respondTo(client, seq), rinfo)
+		expect(client.is_synced).toBe(true)
+
+		// 3s after the Sync, which is 2.5s after the Delay_Resp
+		await vi.advanceTimersByTimeAsync(2_600)
 		expect(client.is_synced).toBe(false)
 		client.destroy()
 	})

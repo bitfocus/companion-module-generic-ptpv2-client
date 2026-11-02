@@ -322,7 +322,12 @@ export interface PTPv1ClientEvents {
 	close: [msg: string]
 	error: [err: Error]
 	listening: [msg: string]
-	ptp_master_changed: [ptp_master: string, address: string, sync: boolean]
+	/**
+	 * `previous` is empty on the first master heard, and holds the clock being replaced on a
+	 * handover. The two are worth telling apart: finding a master for the first time is the
+	 * connection working, where a handover means the one it was following went quiet.
+	 */
+	ptp_master_changed: [ptp_master: string, address: string, sync: boolean, previous: string]
 	/** Every distinct clock seen sending Sync on the joined subdomain, in the order first seen */
 	masters: [masters: string[]]
 	/** More than one clock is sending Sync on this subdomain right now, or has stopped being */
@@ -973,6 +978,7 @@ export class PTPv1Client extends EventEmitter<PTPv1ClientEvents> {
 	 * closer to the truth than zero would while the new master's first exchange completes.
 	 */
 	private adoptMaster(source: string, address: string, buffer: Buffer): void {
+		const previous = this.ptpMaster
 		this.ptpMaster = source
 		this.ptpMasterAddress = address
 		// Copied, not referenced: dgram reuses its receive buffer for the next datagram
@@ -985,7 +991,7 @@ export class PTPv1Client extends EventEmitter<PTPv1ClientEvents> {
 		this.unansweredDelayReqs = 0
 		this.pending = undefined
 		this.sync_change(false)
-		this.emit('ptp_master_changed', this.ptpMaster, address, this.sync)
+		this.emit('ptp_master_changed', this.ptpMaster, address, this.sync, previous)
 	}
 
 	/**

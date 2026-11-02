@@ -119,9 +119,17 @@ export default class ModuleInstance extends InstanceBase<ModuleSchema> {
 	}
 
 	private listenForClientEvents(client: PTPv2Client): void {
-		client.on('ptp_master_changed', (ptp_master, master_address, sync) => {
-			this.log('warn', `PTPv2 Master Changed: ${ptp_master} Address: ${master_address}`)
-			this.log(sync ? 'info' : 'warn', `PTP Sync Changed. ${sync ? 'Locked' : 'Unlocked'}`)
+		client.on('ptp_master_changed', (ptp_master, master_address, _sync, previous) => {
+			// Finding a master for the first time is the connection working, so it is not a
+			// warning. A handover is: the clock being followed went quiet for longer than its
+			// own receipt timeout, and naming the one it replaced is what makes that readable.
+			// The sync state is deliberately not logged here — sync_changed reports a real
+			// transition, and on a first adoption there is none to report.
+			if (previous === '') {
+				this.log('info', `PTPv2 Master: ${ptp_master} Address: ${master_address}`)
+			} else {
+				this.log('warn', `PTPv2 Master Changed: ${previous} -> ${ptp_master} Address: ${master_address}`)
+			}
 			this.checkAllFeedbacks()
 			// A new master invalidates the time derived from the old one, which sharedValues
 			// reports as unset until the next exchange completes
@@ -228,9 +236,17 @@ export default class ModuleInstance extends InstanceBase<ModuleSchema> {
 	 * IEEE 1588-2002 defines only the end to end exchange.
 	 */
 	private listenForV1ClientEvents(client: PTPv1Client): void {
-		client.on('ptp_master_changed', (ptp_master, master_address, sync) => {
-			this.log('warn', `PTPv1 Master Changed: ${ptp_master} Address: ${master_address}`)
-			this.log(sync ? 'info' : 'warn', `PTP Sync Changed. ${sync ? 'Locked' : 'Unlocked'}`)
+		client.on('ptp_master_changed', (ptp_master, master_address, _sync, previous) => {
+			// Finding a master for the first time is the connection working, so it is not a
+			// warning. A handover is: the clock being followed went quiet for longer than its
+			// own receipt timeout, and naming the one it replaced is what makes that readable.
+			// The sync state is deliberately not logged here — sync_changed reports a real
+			// transition, and on a first adoption there is none to report.
+			if (previous === '') {
+				this.log('info', `PTPv1 Master: ${ptp_master} Address: ${master_address}`)
+			} else {
+				this.log('warn', `PTPv1 Master Changed: ${previous} -> ${ptp_master} Address: ${master_address}`)
+			}
 			this.checkAllFeedbacks()
 			this.setVariableValues(this.sharedValues())
 		})

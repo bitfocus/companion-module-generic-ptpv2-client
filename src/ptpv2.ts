@@ -465,7 +465,12 @@ export interface PTPv2ClientEvents {
 	announce: [announce: PtpAnnounce]
 	flags_changed: [flags: PtpFlags]
 	domains: [domains: SetIterator<number>]
-	ptp_master_changed: [ptp_master: string, address: string, sync: boolean]
+	/**
+	 * `previous` is empty on the first master heard, and holds the clock being replaced on a
+	 * handover. The two are worth telling apart: finding a master for the first time is the
+	 * connection working, where a handover means the one it was following went quiet.
+	 */
+	ptp_master_changed: [ptp_master: string, address: string, sync: boolean, previous: string]
 	/** Every distinct clock seen sending Sync on the joined domain, in the order first seen */
 	masters: [masters: string[]]
 	/** More than one clock is sending Sync on this domain right now, or has stopped being */
@@ -1193,6 +1198,7 @@ export class PTPv2Client extends EventEmitter<PTPv2ClientEvents> {
 	 * master's first exchange completes.
 	 */
 	private adoptMaster(source: string, address: string, buffer: Buffer): void {
+		const previous = this.ptpMaster
 		this.ptpMaster = source
 		this.ptpMasterAddress = address
 		// copied, not a subarray: the socket's buffer is not ours to hold on to
@@ -1208,7 +1214,7 @@ export class PTPv2Client extends EventEmitter<PTPv2ClientEvents> {
 		this.pending = undefined
 		// Route through sync_change so listeners see the transition
 		this.sync_change(false)
-		this.emit('ptp_master_changed', this.ptpMaster, address, this.sync)
+		this.emit('ptp_master_changed', this.ptpMaster, address, this.sync, previous)
 	}
 
 	/**

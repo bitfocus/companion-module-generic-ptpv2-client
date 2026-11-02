@@ -892,6 +892,33 @@ describe('PTPv1 split domain', () => {
 		client.destroy()
 	})
 
+	it('reports no previous master on the first one heard', async () => {
+		// The module logs the first master at info and a handover at warn, and this is what
+		// it tells them apart by. Finding a master is the connection working.
+		const client = await makeClient()
+		const changed = vi.fn()
+		client.on('ptp_master_changed', changed)
+		eventSocket().emit('message', makeSync({ uuid: A }), rinfo)
+		expect(changed).toHaveBeenCalledWith('aa-aa-aa-aa-aa-aa:1', rinfo.address, false, '')
+		client.destroy()
+	})
+
+	it('names the clock it replaced on a handover', async () => {
+		vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'setInterval', 'clearInterval', 'Date', 'hrtime'] })
+		const client = new PTPv1Client('0.0.0.0', '_DFLT', 125)
+		await vi.advanceTimersByTimeAsync(0)
+		await vi.advanceTimersByTimeAsync(0)
+		eventSocket().emit('message', makeSync({ uuid: A }), rinfo)
+		const changed = vi.fn()
+		client.on('ptp_master_changed', changed)
+
+		await vi.advanceTimersByTimeAsync(client.sync_receipt_timeout + 1000)
+		eventSocket().emit('message', makeSync({ uuid: B }), rinfoB)
+		expect(changed).toHaveBeenCalledWith('bb-bb-bb-bb-bb-bb:1', rinfoB.address, false, 'aa-aa-aa-aa-aa-aa:1')
+		vi.useRealTimers()
+		client.destroy()
+	})
+
 	it('reports both clocks and raises contention', async () => {
 		const client = await makeClient()
 		const contention = vi.fn()

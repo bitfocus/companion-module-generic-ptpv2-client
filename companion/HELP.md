@@ -117,7 +117,7 @@ Several connections can watch one interface at once — PTPv1 and PTPv2 together
 
 Each connection identifies itself to the master by a clock identity and a port number. The clock identity comes from the interface, so connections watching the same one share it; the port number is picked per connection so that their Delay Requests stay distinguishable. Without that they would accept each other's replies and each report a time built from another connection's timestamps.
 
-> **Do not enable Unicast Delay Requests on more than one connection per interface.** Multicast is delivered to every connection sharing a socket, but a unicast reply is delivered to only one of them. The others never see their Delay Response and never lock. Leave it off where several connections share an interface, or enable it on one of them only.
+> **Unicast Delay Requests only work where this connection is the only thing on the computer listening on ports 319 and 320.** Multicast is delivered to every connection sharing a socket, but a unicast reply is delivered to only one of them — and the operating system chooses which, not the connection that sent the request. Enabling it on just one of several connections is therefore not enough: the reply can be handed to one of the others, which discards it, and the connection that asked never locks. Leave it off wherever more than one connection, or any other PTP software, is running on this computer.
 
 Note also that each connection runs its own delay exchange, so two connections send twice the requests of one.
 
@@ -145,7 +145,7 @@ By default a Delay_Req goes to the multicast group, which means every device on 
 
 It is also a diagnostic. If multicast requests go unanswered but unicast ones succeed, the master is fine and the group is being filtered somewhere in between — a different fault, and a different fix, from a master that is ignoring the module.
 
-Only one connection per interface may use it — see above.
+It only works where this connection is the only thing on the computer listening on ports 319 and 320 — see above.
 
 ### Measuring what arrives
 

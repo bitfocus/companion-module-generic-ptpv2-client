@@ -212,6 +212,16 @@ describe('config field visibility', () => {
 		expect(field('domain').disableAutoExpression).toBe(true)
 	})
 
+	it('warns that unicast delay requests need sole use of the PTP ports', () => {
+		// A unicast reply reaches only one of the sockets sharing a port, and the OS picks
+		// which — so enabling this on one of several connections is not enough. The field's
+		// own help is what most users read, so the restriction has to be there and not only
+		// in HELP.md.
+		const help = (field('unicastDelayReqHelp') as unknown as { value: string }).value
+		expect(help).toMatch(/only thing on this computer listening on PTP ports 319 and 320/i)
+		expect(help).toMatch(/operating system chooses which|not the connection that asked/i)
+	})
+
 	it('warns about a 1588-2019 domain only when one is actually selected', () => {
 		// Both halves matter: a stored domain above 127 must not surface the warning on a
 		// PTPv1 connection, where the domain field means nothing

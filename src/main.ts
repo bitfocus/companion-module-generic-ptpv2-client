@@ -285,7 +285,9 @@ export default class ModuleInstance extends InstanceBase<ModuleSchema> {
 					`Master has not answered the last ${unanswered} Delay Requests sent to ${destination}. ` +
 						`Without a response the clock cannot lock. ` +
 						(this.config?.unicastDelayReq
-							? `Delay Requests are already unicast, so the master itself is not responding — check that it permits them.`
+							? `Delay Requests are already unicast, so either the master is not answering them, or something else on this ` +
+								`computer is listening on port 320 and was handed the reply — another PTP connection, or other PTP software. ` +
+								`A unicast reply reaches only one of the sockets sharing a port, and not necessarily the one that asked.`
 							: `Try enabling Unicast Delay Requests: if that works, the multicast group is being filtered rather than the master ignoring us.`),
 				)
 			}

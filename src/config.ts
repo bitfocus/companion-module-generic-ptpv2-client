@@ -127,7 +127,10 @@ export function GetConfigFields(): SomeCompanionConfigField[] {
 				`Dante offers the same setting per device, and Audinate recommends it on larger networks for the same reason. ` +
 				`The master still answers, and its reply is unicast back. ` +
 				`Multicast is used until the first Sync arrives, because until then there is no master address to send to. ` +
-				`If the multicast group is being filtered somewhere, this is also the way to tell a master that is ignoring us from a path that is dropping the request.`,
+				`If the multicast group is being filtered somewhere, this is also the way to tell a master that is ignoring us from a path that is dropping the request. ` +
+				`<strong>Only use this where this connection is the only thing on this computer listening on PTP ports 319 and 320.</strong> ` +
+				`A unicast reply is delivered to just one of the sockets sharing a port, and the operating system chooses which — not the connection that asked. ` +
+				`So a second PTP connection, or any other PTP software running here, can be handed the reply and discard it, leaving this connection unable to lock.`,
 			width: 12,
 		},
 		{

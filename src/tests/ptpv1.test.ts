@@ -791,6 +791,63 @@ describe('PTPv1 sync rate and loss', () => {
 		client.destroy()
 	})
 
+	it('keeps republishing while nothing arrives, so the rate decays to zero', async () => {
+		// These figures exist to report multicast being dropped. Publishing them only when a
+		// Sync arrives means that on total loss — the case they are for — a button keeps
+		// reading the last healthy rate and no loss.
+		vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'setInterval', 'clearInterval', 'Date', 'hrtime'] })
+		const client = new PTPv1Client('0.0.0.0', '_DFLT', 125)
+		await vi.advanceTimersByTimeAsync(0)
+		await vi.advanceTimersByTimeAsync(0)
+		for (let i = 1; i <= 9; i++) {
+			eventSocket().emit('message', makeSync({ sequence: i }), rinfo)
+			await vi.advanceTimersByTimeAsync(125) // 8 per second
+		}
+		expect(client.sync_rate).toBeCloseTo(8, 1)
+
+		// The master goes quiet. Nothing else drives an update.
+		const published: number[] = []
+		client.on('metrics_changed', () => published.push(client.sync_rate))
+		await vi.advanceTimersByTimeAsync(12_000) // past the averaging window
+
+		expect(client.sync_rate).toBe(0)
+		expect(published.length).toBeGreaterThan(0)
+		expect(published.at(-1)).toBe(0)
+		vi.useRealTimers()
+		client.destroy()
+	})
+
+	it('seeds the figures once, then stops republishing while they are at rest', async () => {
+		// An idle connection must not rewrite the same values for as long as it is open. One
+		// publication is expected and wanted: it establishes the zeroes.
+		vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'setInterval', 'clearInterval', 'Date', 'hrtime'] })
+		const client = new PTPv1Client('0.0.0.0', '_DFLT', 125)
+		await vi.advanceTimersByTimeAsync(0)
+		await vi.advanceTimersByTimeAsync(0)
+		const published = vi.fn()
+		client.on('metrics_changed', published)
+		await vi.advanceTimersByTimeAsync(30_000)
+		expect(published).toHaveBeenCalledTimes(1)
+		vi.useRealTimers()
+		client.destroy()
+	})
+
+	it('stops the heartbeat on destroy', async () => {
+		vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'setInterval', 'clearInterval', 'Date', 'hrtime'] })
+		const client = new PTPv1Client('0.0.0.0', '_DFLT', 125)
+		await vi.advanceTimersByTimeAsync(0)
+		await vi.advanceTimersByTimeAsync(0)
+		eventSocket().emit('message', makeSync({ sequence: 1 }), rinfo)
+		await vi.advanceTimersByTimeAsync(125)
+		eventSocket().emit('message', makeSync({ sequence: 2 }), rinfo)
+		client.destroy()
+		const published = vi.fn()
+		client.on('metrics_changed', published)
+		await vi.advanceTimersByTimeAsync(30_000)
+		expect(published).not.toHaveBeenCalled()
+		vi.useRealTimers()
+	})
+
 	it('measures the rate the Syncs actually arrive at', async () => {
 		vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'setInterval', 'clearInterval', 'Date', 'hrtime'] })
 		const client = new PTPv1Client('0.0.0.0', '_DFLT', 125)

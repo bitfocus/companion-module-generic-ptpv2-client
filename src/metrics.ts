@@ -22,6 +22,16 @@ const SEQUENCE_DISCONTINUITY = 1000
 export const METRICS_WINDOW_MS = 10_000
 
 /**
+ * Shortest gap between two publications of the rate and loss figures.
+ *
+ * Also the heartbeat the clients republish on. The figures are derived from a sliding
+ * window, so they change as it drains whether or not anything arrives — and nothing
+ * arriving is the case they exist to report. Without a heartbeat they would hold their last
+ * value exactly when a master had gone silent, reading a healthy rate and no loss.
+ */
+export const METRICS_PUBLISH_MS = 1_000
+
+/**
  * How far back a sequence number may be and still be read as a packet that arrived out of
  * order rather than as a renumbering.
  *

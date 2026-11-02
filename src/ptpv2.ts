@@ -4,7 +4,7 @@ import { isIPv4 } from 'net'
 import { networkInterfaces } from 'os'
 import { randomBytes } from 'crypto'
 import { lookupOui } from './oui.js'
-import { SlidingWindow, StepDetector, classifySequence, round } from './metrics.js'
+import { METRICS_PUBLISH_MS, SlidingWindow, StepDetector, classifySequence, round } from './metrics.js'
 
 export type PtpTime = [number, number]
 
@@ -555,6 +555,10 @@ export class PTPv2Client extends EventEmitter<PTPv2ClientEvents> {
 	private lastSyncSeq: number | undefined = undefined
 	private syncLostTotal: number = 0
 	private lastMetricsEmit: number = 0
+	private lastMetricsSignature: string = ''
+	// The figures move as the window drains, so they have to be republished even when
+	// nothing is arriving — which is the condition they exist to report
+	private metricsTimer: NodeJS.Timeout | undefined = undefined
 	// A Delay_Req that is never answered is the one hard failure that otherwise says nothing
 	// at all: the clock simply never locks. Counted rather than timed, because the request
 	// rate is the configured interval and so already paced.
@@ -637,6 +641,12 @@ export class PTPv2Client extends EventEmitter<PTPv2ClientEvents> {
 		this.portIdentity = Buffer.alloc(PORT_IDENTITY_LENGTH)
 		clockIdentityForAddress(this.addr).copy(this.portIdentity, 0)
 		this.portIdentity.writeUInt16BE(randomPortNumber(), 8)
+
+		// Keep the rate and loss figures honest while nothing is arriving: the sliding window
+		// drains on its own, and a master that has gone silent must read as 0 per second
+		// rather than hold the last healthy value it published.
+		this.metricsTimer = setInterval(() => this.emitMetrics(), METRICS_PUBLISH_MS)
+		this.metricsTimer.unref?.()
 
 		this.ptpClientEvent.on('listening', () => {
 			this.joinMulticast(this.ptpClientEvent)
@@ -1071,6 +1081,8 @@ export class PTPv2Client extends EventEmitter<PTPv2ClientEvents> {
 	public destroy(): void {
 		if (this.destroyed) return
 		this.destroyed = true
+		if (this.metricsTimer) clearInterval(this.metricsTimer)
+		this.metricsTimer = undefined
 		if (this.syncTimeout) clearTimeout(this.syncTimeout)
 		this.syncTimeout = undefined
 		if (this.announceTimeout) clearTimeout(this.announceTimeout)
@@ -1298,7 +1310,13 @@ export class PTPv2Client extends EventEmitter<PTPv2ClientEvents> {
 	 */
 	private emitMetrics(): void {
 		const now = Date.now()
-		if (now - this.lastMetricsEmit < 1000) return
+		if (now - this.lastMetricsEmit < METRICS_PUBLISH_MS) return
+		// Publish only what has moved. The heartbeat calls this every second so the figures
+		// keep decaying while nothing arrives, and without this check an idle connection
+		// would rewrite the same values for as long as it was open.
+		const signature = `${this.sync_rate}|${this.sync_loss_percent}|${this.syncLostTotal}|${this.announce_rate}`
+		if (signature === this.lastMetricsSignature) return
+		this.lastMetricsSignature = signature
 		this.lastMetricsEmit = now
 		this.emit('metrics_changed')
 	}

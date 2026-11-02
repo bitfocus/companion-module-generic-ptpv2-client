@@ -3,7 +3,7 @@ import {
 	SlidingWindow,
 	StepDetector,
 	median,
-	missedBetween,
+	classifySequence,
 	round,
 	METRICS_WINDOW_MS,
 	STEP_SAMPLES,
@@ -16,42 +16,49 @@ import {
  * A passive observer cannot see a message that never arrived. The only evidence it was sent
  * is the hole it leaves in the sender's sequence numbering, which is what this counts.
  */
-describe('missedBetween', () => {
+describe('classifySequence', () => {
 	it('reports nothing missed for consecutive messages', () => {
-		expect(missedBetween(10, 11)).toBe(0)
+		expect(classifySequence(10, 11)).toEqual({ kind: 'advance', missed: 0 })
 	})
 
 	it('counts the messages a gap implies', () => {
-		expect(missedBetween(10, 11)).toBe(0)
-		expect(missedBetween(10, 12)).toBe(1)
-		expect(missedBetween(10, 15)).toBe(4)
+		expect(classifySequence(10, 12)).toEqual({ kind: 'advance', missed: 1 })
+		expect(classifySequence(10, 15)).toEqual({ kind: 'advance', missed: 4 })
 	})
 
 	it('counts across the 16 bit wrap, which every PTP sequence does', () => {
-		expect(missedBetween(65535, 0)).toBe(0)
+		expect(classifySequence(65535, 0)).toEqual({ kind: 'advance', missed: 0 })
 		// 65534 -> 1 skips both 65535 and 0
-		expect(missedBetween(65534, 1)).toBe(2)
+		expect(classifySequence(65534, 1)).toEqual({ kind: 'advance', missed: 2 })
 	})
 
-	it('refuses to guess at a repeat', () => {
-		// The same message twice is not loss, and must not re-base the count either
-		expect(missedBetween(10, 10)).toBeUndefined()
+	it('names a repeat, which is neither loss nor an arrival to credit', () => {
+		expect(classifySequence(10, 10)).toEqual({ kind: 'repeat' })
 	})
 
-	it('refuses to guess at a message that arrived out of order', () => {
-		expect(missedBetween(10, 9)).toBeUndefined()
-		expect(missedBetween(10, 5)).toBeUndefined()
+	it('names a message that arrived out of order, and how far back it is', () => {
+		// The distinction that matters: reordered is not dropped, and the newest seen must
+		// not move backwards to it
+		expect(classifySequence(10, 9)).toEqual({ kind: 'late', by: 1 })
+		expect(classifySequence(10, 5)).toEqual({ kind: 'late', by: 5 })
+		expect(classifySequence(0, 65535)).toEqual({ kind: 'late', by: 1 })
 	})
 
 	it('treats a jump too large to be loss as a restart', () => {
 		// Loss on that scale would have tripped the receipt timeout many times over, so
 		// counting it would only inflate the figure every time a master reboots
-		expect(missedBetween(10, 5000)).toBeUndefined()
-		expect(missedBetween(60000, 1000)).toBeUndefined()
+		expect(classifySequence(10, 5000)).toEqual({ kind: 'restart' })
+		expect(classifySequence(60000, 1000)).toEqual({ kind: 'restart' })
+	})
+
+	it('reads a counter restarting well back as a restart, not a late arrival', () => {
+		// A restart mistaken for a late arrival would never re-base, and the loss figure
+		// would stay stuck from then on
+		expect(classifySequence(500, 0)).toEqual({ kind: 'restart' })
 	})
 
 	it('still counts a gap just under the discontinuity threshold', () => {
-		expect(missedBetween(0, 999)).toBe(998)
+		expect(classifySequence(0, 1000)).toEqual({ kind: 'advance', missed: 999 })
 	})
 })
 
@@ -88,6 +95,15 @@ describe('SlidingWindow', () => {
 		const w = new SlidingWindow(1000)
 		w.add(4, 0)
 		expect(w.count(0)).toBe(4)
+	})
+
+	it('drops the most recent events, for a loss that turned out to be a late arrival', () => {
+		const w = new SlidingWindow(1000)
+		w.add(3, 0)
+		w.remove(1)
+		expect(w.count(0)).toBe(2)
+		w.remove(5) // more than it holds
+		expect(w.count(0)).toBe(0)
 	})
 
 	it('drops everything on reset, as a master change requires', () => {

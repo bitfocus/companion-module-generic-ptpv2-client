@@ -711,6 +711,43 @@ describe('PTPv1 sync rate and loss', () => {
 		client.destroy()
 	})
 
+	it('does not count a Sync that arrived out of order as loss', async () => {
+		// 10, 12, 11, 13: every message arrived, two of them swapped on the way. Counting a
+		// reorder as loss sends an operator hunting multicast drops that are not happening,
+		// and a LAG or ECMP path between sites reorders as a matter of course.
+		const client = await makeClient()
+		for (const seq of [10, 12, 11, 13]) eventSocket().emit('message', makeSync({ sequence: seq }), rinfo)
+		expect(client.sync_lost_total).toBe(0)
+		expect(client.sync_loss_percent).toBe(0)
+		client.destroy()
+	})
+
+	it('keeps counting correctly after a reorder, rather than re-basing backwards', async () => {
+		// The newest sequence seen must not move back to the late one, or the gap its
+		// successor already accounted for is counted a second time
+		const client = await makeClient()
+		for (const seq of [10, 12, 11, 13, 15, 14, 16]) {
+			eventSocket().emit('message', makeSync({ sequence: seq }), rinfo)
+		}
+		expect(client.sync_lost_total).toBe(0)
+		client.destroy()
+	})
+
+	it('still counts genuine loss, which a reorder must not mask', async () => {
+		const client = await makeClient()
+		for (const seq of [10, 13]) eventSocket().emit('message', makeSync({ sequence: seq }), rinfo)
+		expect(client.sync_lost_total).toBe(2) // 11 and 12 never came
+		client.destroy()
+	})
+
+	it('does not credit a late arrival below zero', async () => {
+		// A reorder with no preceding gap must not drive the count negative
+		const client = await makeClient()
+		for (const seq of [10, 9]) eventSocket().emit('message', makeSync({ sequence: seq }), rinfo)
+		expect(client.sync_lost_total).toBe(0)
+		client.destroy()
+	})
+
 	it('does not count a repeated Sync as loss', async () => {
 		const client = await makeClient()
 		eventSocket().emit('message', makeSync({ sequence: 4 }), rinfo)

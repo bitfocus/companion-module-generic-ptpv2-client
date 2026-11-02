@@ -22,17 +22,37 @@ const SEQUENCE_DISCONTINUITY = 1000
 export const METRICS_WINDOW_MS = 10_000
 
 /**
- * How many messages went missing between two sequence numbers.
+ * How far back a sequence number may be and still be read as a packet that arrived out of
+ * order rather than as a renumbering.
  *
- * @returns the number of messages missed, or `undefined` when the two numbers cannot be
- *          compared — a repeat, a reordering, or a jump large enough to be a restart. The
- *          caller re-bases on the new value in that case rather than counting anything.
+ * Deliberately small. Reordering on a LAG or an ECMP path moves a packet by a handful of
+ * places, while a master restarting its counter can land anywhere — and a restart mistaken
+ * for a late arrival would never re-base, leaving the loss figure stuck for good.
  */
-export function missedBetween(previous: number, current: number): number | undefined {
+const SEQUENCE_LATE_WINDOW = 16
+
+/**
+ * What a new sequence number means relative to the newest one seen.
+ *
+ *  - `advance`  — the expected direction. `missed` is how many numbers it skipped, often 0.
+ *  - `repeat`   — the same number again. Neither loss nor an arrival to credit.
+ *  - `late`     — an older number: it was reordered on the way, not dropped. The newest seen
+ *                 must not move backwards to it, or the gap its successor already accounted
+ *                 for gets counted a second time when the next message arrives.
+ *  - `restart`  — too far to compare. Re-base without counting.
+ */
+export type SequenceStep =
+	{ kind: 'advance'; missed: number } | { kind: 'repeat' } | { kind: 'late'; by: number } | { kind: 'restart' }
+
+/** Classify a sequence number against the newest one seen. See {@link SequenceStep}. */
+export function classifySequence(previous: number, current: number): SequenceStep {
 	const delta = (current - previous + SEQUENCE_MODULUS) % SEQUENCE_MODULUS
-	if (delta === 0) return undefined // the same message twice
-	if (delta > SEQUENCE_DISCONTINUITY) return undefined // restart, renumber, or arrived late
-	return delta - 1
+	if (delta === 0) return { kind: 'repeat' }
+	if (delta <= SEQUENCE_DISCONTINUITY) return { kind: 'advance', missed: delta - 1 }
+	if (delta >= SEQUENCE_MODULUS - SEQUENCE_LATE_WINDOW) {
+		return { kind: 'late', by: SEQUENCE_MODULUS - delta }
+	}
+	return { kind: 'restart' }
 }
 
 /**
@@ -66,6 +86,14 @@ export class SlidingWindow {
 		const span = this.events[this.events.length - 1] - this.events[0]
 		if (span <= 0) return 0
 		return ((this.events.length - 1) * 1000) / span
+	}
+
+	/**
+	 * Drop up to `count` of the most recent events, for a loss that turned out to be a packet
+	 * arriving late rather than one that never came.
+	 */
+	remove(count: number = 1): void {
+		for (let i = 0; i < count && this.events.length > 0; i++) this.events.pop()
 	}
 
 	reset(): void {

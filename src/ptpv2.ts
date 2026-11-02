@@ -4,7 +4,7 @@ import { isIPv4 } from 'net'
 import { networkInterfaces } from 'os'
 import { randomBytes } from 'crypto'
 import { lookupOui } from './oui.js'
-import { SlidingWindow, StepDetector, missedBetween, round } from './metrics.js'
+import { SlidingWindow, StepDetector, classifySequence, round } from './metrics.js'
 
 export type PtpTime = [number, number]
 
@@ -1245,20 +1245,40 @@ export class PTPv2Client extends EventEmitter<PTPv2ClientEvents> {
 	private noteSync(sequence: number): void {
 		this.syncWindow.add()
 		if (this.lastSyncSeq !== undefined) {
-			const missed = missedBetween(this.lastSyncSeq, sequence)
-			if (missed === undefined) {
-				// A repeat, a reordering, or a restart — re-base rather than count it
-				this.lastSyncSeq = sequence
-				this.emitMetrics()
-				return
-			}
-			if (missed > 0) {
-				this.syncLostTotal += missed
-				this.syncLostWindow.add(missed)
+			const step = classifySequence(this.lastSyncSeq, sequence)
+			switch (step.kind) {
+				case 'advance':
+					if (step.missed > 0) {
+						this.syncLostTotal += step.missed
+						this.syncLostWindow.add(step.missed)
+					}
+					break
+				case 'late':
+					// It arrived after all, just out of order, so the gap counted when its
+					// successor came is not loss. Crediting it back is what keeps a reordering
+					// path from reading as a lossy one. The newest seen stays where it is.
+					this.creditLateSync()
+					this.emitMetrics()
+					return
+				case 'repeat':
+					// The same message twice is neither loss nor an arrival to credit
+					this.emitMetrics()
+					return
+				case 'restart':
+					this.lastSyncSeq = sequence
+					this.emitMetrics()
+					return
 			}
 		}
 		this.lastSyncSeq = sequence
 		this.emitMetrics()
+	}
+
+	/** Take one message back off the loss figures, bottoming out at zero */
+	private creditLateSync(): void {
+		if (this.syncLostTotal === 0) return
+		this.syncLostTotal--
+		this.syncLostWindow.remove(1)
 	}
 
 	/** Reset every measurement that belongs to the clock being left behind */
